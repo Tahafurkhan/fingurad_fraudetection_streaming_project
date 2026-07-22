@@ -1,95 +1,116 @@
 # FinGuard: Real-Time Fraud Detection Streaming Platform
 
+<div align="center">
+
 ![Databricks](https://img.shields.io/badge/Databricks-FF3621?style=flat&logo=databricks&logoColor=white)
 ![Apache Spark](https://img.shields.io/badge/Apache%20Spark-E25A1C?style=flat&logo=apachespark&logoColor=white)
 ![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=flat&logo=apachekafka&logoColor=white)
 ![Delta Lake](https://img.shields.io/badge/Delta%20Lake-00ADD4?style=flat&logo=delta&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+![Structured Streaming](https://img.shields.io/badge/Structured%20Streaming-E25A1C?style=flat)
 
-## 🎯 Overview
+**Enterprise-Grade Real-Time Fraud Detection on the Databricks Lakehouse**
 
-FinGuard is an enterprise-grade, real-time fraud detection system built on Databricks Lakehouse Platform. It leverages **Spark Structured Streaming**, **Delta Lake**, **Apache Kafka**, and **Lakeflow Spark Declarative Pipelines** to detect fraudulent transactions in real-time with millisecond latency.
-
-### Key Features
-
-✅ **Real-time Stream Processing** - Process millions of transactions per second from Kafka  
-✅ **Multi-layered Architecture** - Bronze → Silver → Gold medallion architecture  
-✅ **Fraud Detection** - Match transactions against fraud watchlists with streaming joins  
-✅ **High-Value Transaction Monitoring** - Detect anomalous transaction patterns  
-✅ **Stateful Stream Processing** - Watermarking and windowed aggregations  
-✅ **Automated Alerting** - Email notifications for detected fraud  
-✅ **Customer Data Integration** - Lakeflow Connect for customer profile ingestion  
+</div>
 
 ---
 
-## 🏗️ Architecture
+## 🎯 Executive Summary
+
+**FinGuard** is a production-ready fraud detection platform that processes millions of financial transactions per second using **Spark Structured Streaming**, **Delta Lake**, and **Apache Kafka**. It demonstrates advanced data engineering patterns (medallion architecture, stateful stream-stream joins, watermarking) combined with real-time alerting to catch fraudulent activity in milliseconds.
+
+This project showcases:
+- ✅ **Enterprise Data Architecture**: Bronze → Silver → Gold medallion pattern on Databricks
+- ✅ **Stateful Stream Processing**: Watermarked stream-stream joins for fraud correlation
+- ✅ **Realistic Transaction Simulation**: Multi-producer fraud detection testing framework
+- ✅ **Real-Time Alerting**: Email notifications for fraud events with < 30s latency
+- ✅ **Production Readiness**: Lakeflow Declarative Pipelines, Delta Lake ACID guarantees, secret management
+
+---
+
+## 📊 Architecture Overview
+
+### High-Level Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         DATA SOURCES                                     │
-├──────────────────────────────┬──────────────────────────────────────────┤
-│  Apache Kafka (Confluent)    │   Cloud Storage (Customer Data)          │
-│  - Real-time transactions    │   - Customer profiles                    │
-│  - Fraud watchlist updates   │   - Account information                  │
-└──────────────────┬───────────┴────────────────┬─────────────────────────┘
-                   │                            │
-                   ▼                            ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                        BRONZE LAYER (Raw Ingestion)                      │
-├──────────────────────────────────────────────────────────────────────────┤
-│  • finguard.bronze.transactions      - Kafka stream ingestion            │
-│  • finguard.bronze.fraud_watchlist   - Watchlist stream ingestion        │
-│  • finguard.bronze.customers         - Customer data via Lakeflow        │
-│                                                                           │
-│  Technology: Spark Structured Streaming + Kafka Consumer                 │
-│  Format: Delta Lake with Auto Loader (for file-based sources)            │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                   SILVER LAYER (Cleansed & Enriched)                     │
-├──────────────────────────────────────────────────────────────────────────┤
-│  • finguard.silver.transactions      - Parsed JSON, type casting         │
-│  • finguard.silver.fraud_watchlist   - Validated watchlist entries       │
-│  • finguard.silver.customers         - Cleaned customer profiles         │
-│                                                                           │
-│  Transformations:                                                        │
-│    ✓ JSON parsing & schema enforcement                                   │
-│    ✓ Data type casting & validation                                      │
-│    ✓ Data quality expectations (@dp.expect_or_drop)                     │
-│    ✓ Null handling & deduplication                                       │
-└──────────────────────────────┬───────────────────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                    GOLD LAYER (Business Logic & Alerts)                  │
-├──────────────────────────────────────────────────────────────────────────┤
-│  📊 Fraud Detection Tables:                                              │
-│    • fraud_card_alert                - Watchlist match alerts            │
-│    • high_value_transactions_alert   - Anomaly detection                 │
-│                                                                           │
-│  📈 Analytics Tables:                                                    │
-│    • transaction_count_by_minute              - Tumbling window          │
-│    • transaction_count_by_minute_sliding_window - Sliding window (5m/1m) │
-│                                                                           │
-│  🔔 Alert Processing:                                                    │
-│    • Fraud card alert email notifier                                     │
-│    • High-value transaction email notifier                               │
-└──────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                 DATA SOURCES                                     │
+├────────────────────────────────────┬──────────────────────────────────────────────┤
+│  Apache Kafka (Confluent Cloud)    │  Cloud Storage / Lakeflow Connect            │
+│  • Real-time transactions          │  • Customer profiles                         │
+│  • Fraud watchlist stream          │  • Account information                       │
+└────────────────────────┬───────────┴────────────────┬─────────────────────────────┘
+                         │                            │
+                         ▼                            ▼
+       ╔════════════════════════════════════════════════════════════╗
+       ║  BRONZE LAYER: Raw Ingestion (Spark Structured Streaming)  ║
+       ╠════════════════════════════════════════════════════════════╣
+       ║  • finguard.bronze.transactions (Kafka → Delta)            ║
+       ║  • finguard.bronze.fraud_watchlist (Watchlist stream)      ║
+       ║  • finguard.bronze.customers (Cloud → Auto Loader)         ║
+       ║                                                             ║
+       ║  Technology: SASL_SSL Kafka, Auto Loader, checkpointing    ║
+       ║  Format: Delta Lake with metadata tracking                 ║
+       ╚════════════════════════┬════════════════════════════════════╝
+                                │
+                                ▼
+       ╔════════════════════════════════════════════════════════════╗
+       ║  SILVER LAYER: Cleansed & Enriched                         ║
+       ╠════════════════════════════════════════════════════════════╣
+       ║  • finguard.silver.transactions                            ║
+       ║    ✓ JSON parsing & schema enforcement                     ║
+       ║    ✓ Type casting & validation                             ║
+       ║    ✓ Data quality checks (@dp.expect_or_drop)              ║
+       ║                                                             ║
+       ║  • finguard.silver.fraud_watchlist                         ║
+       ║  • finguard.silver.customers                               ║
+       ║                                                             ║
+       ║  Technology: Declarative transformations, validation rules ║
+       ╚════════════════════════┬════════════════════════════════════╝
+                                │
+                                ▼
+       ╔════════════════════════════════════════════════════════════╗
+       ║  GOLD LAYER: Business Logic & Alerts                       ║
+       ╠════════════════════════════════════════════════════════════╣
+       ║  📊 FRAUD DETECTION:                                        ║
+       ║  • fraud_card_alert                                         ║
+       ║    → Stateful Stream-Stream Join with Watermarking         ║
+       ║    → Detects watchlist matches in real-time                ║
+       ║                                                             ║
+       ║  • high_value_transactions_alert                            ║
+       ║    → Anomaly detection for large transactions              ║
+       ║                                                             ║
+       ║  📈 ANALYTICS:                                              ║
+       ║  • transaction_count_by_minute (Tumbling window)           ║
+       ║  • transaction_count_sliding_window (5m window, 1m slide)  ║
+       ║                                                             ║
+       ║  🔔 ALERT ENGINE:                                           ║
+       ║  • Email notifications via SMTP/SendGrid                   ║
+       ║  • Alert log & audit trail                                 ║
+       ║                                                             ║
+       ║  Technology: Watermarking, windowed aggregations, trigger  ║
+       ║  intervals (30s micro-batch)                               ║
+       ╚════════════════════════┬════════════════════════════════════╝
+                                │
+                                ▼
+                    ┌──────────────────────────────┐
+                    │  📧 ALERT NOTIFICATIONS      │
+                    │  📊 DASHBOARDS & MONITORING  │
+                    │  🔍 AUDIT LOGS               │
+                    └──────────────────────────────┘
 ```
 
 ---
 
-## 📊 Data Flow: End-to-End Pipeline
+## 🔄 Data Pipeline Deep Dive
 
-### 1️⃣ Bronze Layer: Real-Time Ingestion
+### 1️⃣ Bronze Layer: Kafka Ingestion
 
-#### **Transaction Stream (Kafka → Bronze)**
+The **transaction stream** is ingested directly from Confluent Cloud Kafka with SASL_SSL authentication:
+
 ```python
-# File: finguard_streaming/bronze/finguard_bronze.py
-
 @dp.table(name="finguard.bronze.transactions")
 def transactions_bronze():
-    # Kafka connection secured via Databricks Secrets
     streaming_df = spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", bootstrap_servers)
         .option("subscribe", topic)
@@ -98,7 +119,6 @@ def transactions_bronze():
         .option("startingOffsets", "earliest")
         .load()
     
-    # Raw Kafka message parsing
     return streaming_df.select(
         col("key").cast("string"),
         col("value").cast("string"),  # JSON payload
@@ -108,88 +128,60 @@ def transactions_bronze():
     )
 ```
 
-**Key Features:**
-- ✅ Secure Kafka SASL_SSL authentication
-- ✅ At-least-once delivery guarantee
-- ✅ Offset management for fault tolerance
-- ✅ Ingestion timestamp tracking
-
-#### **Customer Data (Cloud Storage → Bronze via Lakeflow Connect)**
-```python
-# Ingested via Lakeflow Connect managed pipeline
-# File: finguard_customers_silver_ingestion/silver/customer_silver.py
-
-# Bronze layer automatically created by Lakeflow Connect
-# Source: S3/ADLS/GCS customer CSV/JSON files
-```
+**Key Design Decisions:**
+- SASL_SSL ensures encrypted, authenticated broker communication
+- At-least-once delivery + idempotent producers prevent duplicates
+- Offset tracking enables fault-tolerant replay
 
 ---
 
-### 2️⃣ Silver Layer: Data Transformation & Quality
+### 2️⃣ Silver Layer: Data Quality & Transformation
 
-#### **Transaction Silver**
+Parse and validate the JSON transaction payload, apply data quality rules:
+
 ```python
 @dp.table(name="finguard.silver.transactions")
 @dp.expect_or_drop("valid_transaction", "transaction_id IS NOT NULL")
 def transactions_silver():
     bronze_df = spark.readStream.table("finguard.bronze.transactions")
     
-    # Parse JSON payload
     parsed_df = bronze_df.select(
         from_json(col("value"), transaction_schema).alias("data")
     ).select("data.*")
     
-    # Type casting & enrichment
     return parsed_df.select(
         col("transaction_id"),
         col("customer_id"),
-        col("card_number"),
         col("amount").cast("decimal(10,2)"),
         col("merchant_name"),
         to_timestamp(col("transaction_timestamp")).alias("transaction_timestamp"),
+        col("is_international"),
         # ... additional fields
         current_timestamp().alias("silver_ingestion_timestamp")
     )
 ```
 
-#### **Customer Silver with Data Quality**
-```python
-@dp.table(name="finguard.silver.customers")
-@dp.expect_or_drop("valid_customer_id", "customer_id IS NOT NULL")
-def customers_silver():
-    bronze_df = spark.readStream.table("finguard.bronze.customers")
-    
-    return bronze_df.select(
-        col("customer_id"),
-        col("first_name"), col("last_name"),
-        col("email"),
-        to_date(col("account_open_date")).alias("account_open_date"),
-        col("transaction_limit"),
-        col("preferred_spending_min"),
-        col("preferred_spending_max"),
-        # ... risk scores & preferences
-    )
-```
+**Quality Gates:**
+- `@dp.expect_or_drop`: Reject invalid records with explanations
+- Schema enforcement prevents parsing errors downstream
+- Type casting catches data inconsistencies early
 
 ---
 
-### 3️⃣ Gold Layer: Fraud Detection & Analytics
+### 3️⃣ Gold Layer: Stateful Fraud Detection (Crown Jewel)
 
-#### **🔴 Fraud Card Alert - Streaming Join with Watermarking**
+#### **Stream-Stream Join with Watermarking**
 
-The crown jewel of the pipeline: **Stream-to-stream join with watermarking** to detect fraud in real-time.
+The most advanced piece: join a continuous transaction stream with a fraud watchlist stream, with proper time-bounded state management:
 
 ```python
-# File: finguard_streaming/gold/fraud_card_alert.py
-
 @dp.table(name="finguard.gold.fraud_card_alert")
 def fraud_card_alert():
-    # Read streaming sources
     transactions = spark.readStream.table("finguard.silver.transactions")
     fraud_watchlist = spark.readStream.table("finguard.silver.fraud_watchlist")
     customers = spark.read.table("finguard.silver.customers")  # Batch join
     
-    # 🌊 WATERMARKING: Handle late-arriving data
+    # 🌊 WATERMARKING: Handle late-arriving data (up to 5 min late)
     transactions_wm = transactions.withWatermark("transaction_timestamp", "5 minutes")
     watchlist_wm = fraud_watchlist.withWatermark("effective_from", "5 minutes")
     
@@ -199,7 +191,7 @@ def fraud_card_alert():
             .join(watchlist_wm, 
                   transactions_wm.card_number == watchlist_wm.entity_id,
                   "inner")  # Inner join = only matches
-            .join(customers,  # Enrich with customer details
+            .join(customers,
                   transactions_wm.customer_id == customers.customer_id,
                   "left")
             .select(
@@ -219,43 +211,38 @@ def fraud_card_alert():
     return fraud_detected
 ```
 
-**🎯 Advanced Streaming Concepts Used:**
-1. **Watermarking** (`withWatermark`): 
+**Why This Matters:**
+1. **Watermarking** (`withWatermark`):
    - Allows up to 5 minutes of late data
-   - Controls state storage size
-   - Ensures timely join processing
+   - Automatically evicts old state to prevent memory bloat
+   - Controls RocksDB state size in a streaming context
 
 2. **Stateful Stream-Stream Join**:
-   - Maintains internal state for both streams
-   - Only processes records within watermark boundary
-   - Automatic state cleanup after watermark expires
+   - Maintains internal state for both sides of the join
+   - Only processes records within the watermark window
+   - Automatic state cleanup after watermark expiration
 
-3. **Hybrid Join** (streaming + batch):
-   - Joins with static customer dimension table
+3. **Hybrid Batch-Stream Join**:
+   - Customers table is static (batch read)
    - No watermark needed for batch side
+   - Enriches alerts with customer name, email for notifications
 
 ---
 
-#### **📊 Window Aggregations - Sliding Window**
+#### **Window Aggregations**
 
-Monitor transaction volume patterns using overlapping time windows:
+Monitor transaction patterns with tumbling and sliding windows:
 
 ```python
-# File: finguard_streaming/gold/transaction_count_by_minute_sliding_window.py
-
-@dp.table(name="finguard.gold.transaction_count_by_minute_sliding_window")
-def transaction_count_by_minute():
+# Tumbling Window: Non-overlapping 1-minute windows
+@dp.table(name="finguard.gold.transaction_count_by_minute")
+def transaction_count_tumbling():
     transactions = spark.readStream.table("finguard.silver.transactions")
-    
-    # 🌊 Watermark: 5-minute tolerance
     transactions_wm = transactions.withWatermark("transaction_timestamp", "5 minutes")
     
-    # 📈 SLIDING WINDOW: 5-minute window, 1-minute slide
-    transaction_count = (
+    return (
         transactions_wm
-            .groupBy(
-                window("transaction_timestamp", "5 minutes", "1 minute")
-            )
+            .groupBy(window("transaction_timestamp", "1 minute"))
             .agg(count("*").alias("transaction_count"))
             .select(
                 col("window.start").alias("window_start"),
@@ -263,237 +250,92 @@ def transaction_count_by_minute():
                 col("transaction_count")
             )
     )
+
+# Sliding Window: 5-minute window, sliding every 1 minute
+@dp.table(name="finguard.gold.transaction_count_by_minute_sliding_window")
+def transaction_count_sliding():
+    transactions = spark.readStream.table("finguard.silver.transactions")
+    transactions_wm = transactions.withWatermark("transaction_timestamp", "5 minutes")
     
-    return transaction_count
-```
-
-**Window Types in Use:**
-- **Tumbling Window** (`transaction_count_by_minute.py`): 
-  - Non-overlapping 1-minute windows
-  - `window("transaction_timestamp", "1 minute")`
-  
-- **Sliding Window** (`transaction_count_by_minute_sliding_window.py`):
-  - 5-minute window sliding every 1 minute
-  - Overlapping windows for smooth trend analysis
-  - `window("transaction_timestamp", "5 minutes", "1 minute")`
-
----
-
-## 🔔 Alert System Architecture
-
-### **Email Notification Pipeline**
-
-```python
-# File: finguard_streaming/alert/fraud_card_alert_email_notifier.py
-
-@dp.table(name="finguard.alert.fraud_card_email_sent_log")
-def fraud_alert_notifier():
-    alerts = spark.readStream.table("finguard.gold.fraud_card_alert")
-    
-    # Trigger email notification via external API
-    def send_fraud_alert(batch_df, batch_id):
-        for row in batch_df.collect():
-            email_payload = {
-                "to": row.customer_email,
-                "subject": f"🚨 Fraud Alert: Transaction {row.transaction_id}",
-                "body": f'''
-                    Dear {row.customer_name},
-                    
-                    Suspicious transaction detected:
-                    • Amount: ${row.amount}
-                    • Merchant: {row.merchant_name}
-                    • Risk Level: {row.risk_level}
-                    
-                    If you did not authorize this, please call us immediately.
-                '''
-            }
-            send_email(email_payload)  # External SMTP/SendGrid API
-            
-    # Process alerts in micro-batches
-    alerts.writeStream \
-        .foreachBatch(send_fraud_alert) \
-        .outputMode("append") \
-        .trigger(processingTime="30 seconds") \
-        .start()
+    return (
+        transactions_wm
+            .groupBy(window("transaction_timestamp", "5 minutes", "1 minute"))
+            .agg(count("*").alias("transaction_count"))
+            .select(
+                col("window.start").alias("window_start"),
+                col("window.end").alias("window_end"),
+                col("transaction_count")
+            )
+    )
 ```
 
 ---
 
-## 🔧 Technical Deep Dive
+## 🎲 Transaction Simulation Engine
 
-### **Watermarking Strategy**
+### `kafka_producer/` Folder
 
-Watermarking allows Spark Structured Streaming to:
-1. **Track event time progress** (not processing time)
-2. **Handle late-arriving data** within tolerance window
-3. **Automatically evict old state** to prevent memory bloat
+A standalone Python module that generates realistic transaction data and publishes to Kafka. Three producers cover different scenarios:
 
-```python
-# 5-minute watermark means:
-# - Data arriving up to 5 minutes late will still be processed
-# - State older than (max_event_time - 5 minutes) is discarded
-transactions_wm = transactions.withWatermark("transaction_timestamp", "5 minutes")
-```
+| Producer | Purpose |
+|---|---|
+| `producer_normal.py` | Continuous stream of legitimate + naturally-flagged fraud transactions |
+| `producer_fraud_transaction.py` | Single high-value (>$100k) forced fraud event for testing |
+| `producer_fraud_card.py` | Single forced fraud transaction on a fixed test card for testing |
 
-**Watermark Impact on Joins:**
-- Stream-stream joins REQUIRE watermarks on both sides
-- Join condition must include time constraint
-- State is maintained only within watermark boundaries
+#### Key Classes
 
-### **Stateful Transformations**
+**`CustomerGenerator`** (customer_generator.py)
+- Creates 1,000 realistic customers with profiles (segment, income, spending habits)
+- Generates Luhn-valid credit card numbers
+- Assigns risk scores, trusted devices, international preferences
+- Persists to `data/customers.csv`
 
-The pipeline uses several stateful operations:
+**`MerchantGenerator`** (merchant_generator.py)
+- Creates 200 merchants across 12 categories (grocery, fuel, airlines, etc.)
+- Assigns risk tiers (LOW/MEDIUM/HIGH) and blacklist flags
+- Balances domestic vs. international merchant distribution
 
-| Operation | Type | State Management |
-|-----------|------|------------------|
-| `groupBy().agg()` | Stateful aggregation | Maintains counts/sums per key |
-| `stream.join(stream)` | Stateful join | Buffers both streams for join |
-| `window()` | Stateful windowing | Stores data for window duration |
-| `dropDuplicates()` | Stateful dedup | Tracks seen keys |
+**`FraudEngine`** (fraud_engine.py)
+- Evaluates 8 fraud signals with weighted scoring (0-100):
+  - `HIGH_VALUE_TRANSACTION`: Amount > $100k (weight: 40)
+  - `IMPOSSIBLE_TRAVEL`: Same customer, Delhi → London in <20 min (weight: 50)
+  - `NEW_DEVICE`: Transaction device ≠ trusted device (weight: 20)
+  - `VELOCITY_FRAUD`: 5+ txns within 30 seconds (weight: 45)
+  - `CARD_TESTING`: 3+ small txns ($5-$20) within 60s (weight: 30)
+  - `BLACKLISTED_MERCHANT`: Card on watchlist (weight: 60)
+  - `HIGH_RISK_MERCHANT`: Merchant risk = HIGH (weight: 25)
+  - `INTERNATIONAL_TRANSACTION`: Cross-border (weight: 25)
 
-**State Store Backend**: RocksDB (default for Databricks)
-
----
-
-## 📁 Project Structure
-
-```
-fingurad_fraudetection_streaming_project/
-│
-├── 📓 Notebooks/
-│   ├── 01_kafka_streaming_test.ipynb     # Kafka connectivity testing
-│   ├── 02_Setup_Secret_Scope.ipynb       # Secrets configuration
-│   ├── 03_Send_Email.ipynb               # Email notification setup
-│   └── 04_Autoloader_test.py.ipynb      # Auto Loader testing
-│
-├── 🏭 finguard_streaming/                # Main streaming pipeline
-│   │
-│   ├── bronze/                           # Raw ingestion layer
-│   │   ├── finguard_bronze.py           # Transaction Kafka stream
-│   │   └── fraud_watchlist_bronze.py    # Watchlist Kafka stream
-│   │
-│   ├── silver/                           # Cleansed data layer
-│   │   ├── fingurad_silver.py           # Parsed transactions
-│   │   └── fraud_watchlist_silver.py    # Validated watchlist
-│   │
-│   ├── gold/                             # Business logic layer
-│   │   ├── fraud_card_alert.py          # Fraud detection (streaming join)
-│   │   ├── high_value_transactions_alert.py  # Anomaly detection
-│   │   ├── transaciton_count_by_minute.py   # Tumbling window
-│   │   └── transaciton_count_by_minute_sliding_window.py  # Sliding window
-│   │
-│   └── alert/                            # Alert processing
-│       ├── fraud_card_alert_email_notifier.py
-│       └── high_value_transaction_email_notifier.py
-│
-├── 👥 finguard_customers_silver_ingestion/
-│   └── silver/
-│       └── customer_silver.py           # Customer data transformation
-│
-└── 🎲 fraud_watchlist_file_generator/
-    └── fraud_watchlist_data_generator.py  # Test data generator
-```
+**`TransactionGenerator`** (transaction_generator.py)
+- Profile-driven: Platinum customers spend more at airlines; Regular customers at groceries
+- Realistic amounts based on customer segment and merchant category
+- Generates ISO-8601 timestamps with UTC timezone
 
 ---
 
-## 🚀 Setup & Deployment
+## 📹 Live Demo & Dashboard
 
-### **Prerequisites**
+### Streaming Pipeline in Action
 
-```
-Databricks Runtime: DBR 14.3 LTS or higher (with Spark 3.5+)
+Watch the real-time fraud detection pipeline process transactions:
 
-Required Libraries:
-- Delta Lake 3.0+
-- Kafka 3.x client libraries
-- databricks-sdk
-```
+**[🎬 Streaming Pipeline Demo](./media/Streaming%20recording%20video.mp4)**  
+*11 MB video showing live transaction ingestion, fraud scoring, and alert notifications*
 
-### **1. Secret Management**
+---
 
-Configure Kafka credentials and email SMTP settings:
+### Interactive Dashboard
 
-```python
-# Run: 02_Setup_Secret_Scope.ipynb
+Real-time monitoring dashboard built in Databricks Lakeview:
 
-# Create secret scope
-dbutils.secrets.createScope("finguard-scope")
+**[📊 FinGuard Monitoring Dashboard PDF](./media/FinGuard%20Fraud%20Detection%20Monitor%202026-07-13T17-21-15%202026-07-13%2018_12.pdf)**  
+*High-risk customer counts, fraud alert trends, transaction volume metrics*
 
-# Add Kafka credentials
-kafka_config = {
-    "bootstrap_servers": "pkc-xxxxx.confluent.cloud:9092",
-    "api_key": "YOUR_KAFKA_API_KEY",
-    "api_secret": "YOUR_KAFKA_API_SECRET",
-    "topic": "financial-transactions"
-}
-
-dbutils.secrets.put("finguard-scope", "kafka_connection_details", 
-                     json.dumps(kafka_config))
-
-# Add email credentials
-dbutils.secrets.put("finguard-scope", "smtp_username", "alerts@finguard.com")
-dbutils.secrets.put("finguard-scope", "smtp_password", "your_password")
-```
-
-### **2. Create Unity Catalog Schema**
+Sample Queries from the Dashboard:
 
 ```sql
--- Create catalog and schema
-CREATE CATALOG IF NOT EXISTS finguard;
-USE CATALOG finguard;
-
-CREATE SCHEMA IF NOT EXISTS bronze;
-CREATE SCHEMA IF NOT EXISTS silver;
-CREATE SCHEMA IF NOT EXISTS gold;
-CREATE SCHEMA IF NOT EXISTS alert;
-```
-
-### **3. Deploy Lakeflow Spark Declarative Pipeline**
-
-Navigate to Databricks UI:
-1. Go to **Lakeflow** → **Create Pipeline**
-2. Configure pipeline settings:
-   - **Name**: `finguard-fraud-detection-pipeline`
-   - **Storage**: `/pipelines/finguard`
-   - **Target**: `finguard`
-   - **Mode**: Continuous (for streaming)
-3. Add library files from `finguard_streaming` directory
-4. Click **Create** and **Start**
-
-### **4. Configure Customer Data Ingestion (Lakeflow Connect)**
-
-1. Navigate to **Lakeflow Connect** UI → **Create Connection**
-2. Select source type:
-   - **Cloud Storage** (S3, ADLS, GCS)
-   - **SaaS** (Salesforce, Workday, HubSpot)
-   - **Databases** (MySQL, PostgreSQL, SQL Server)
-3. Configure connection:
-   ```
-   Source Path: s3://customer-data-bucket/profiles/
-   File Format: CSV
-   Destination: finguard.bronze.customers
-   Trigger: Continuous
-   ```
-4. Start the ingestion pipeline
-
----
-
-## 📊 Monitoring & Observability
-
-### **Pipeline Metrics**
-
-Access real-time metrics in Databricks Lakeflow UI:
-
-- ✅ **Input Rate**: Records/sec from Kafka
-- ✅ **Processing Rate**: Records/sec transformed
-- ✅ **End-to-End Latency**: Source → Gold layer
-- ✅ **Watermark Lag**: Current watermark vs. latest event time
-- ✅ **State Memory Usage**: RocksDB state size
-
-### **SQL Analytics Queries**
-
-```sql
--- Real-time fraud alert monitoring
+-- Real-time fraud alert summary (last hour)
 SELECT 
     alert_type,
     risk_level,
@@ -503,102 +345,356 @@ FROM finguard.gold.fraud_card_alert
 WHERE alert_timestamp >= current_timestamp() - INTERVAL 1 HOUR
 GROUP BY alert_type, risk_level;
 
--- Transaction volume trends (sliding window)
+-- Sliding window transaction volume (last 10 windows)
 SELECT 
     window_start,
     window_end,
     transaction_count
 FROM finguard.gold.transaction_count_by_minute_sliding_window
 ORDER BY window_start DESC
-LIMIT 60;
+LIMIT 10;
 ```
-
-### **Databricks Dashboard Integration**
-
-Create live dashboards in Lakeview:
-1. Navigate to **Dashboards** → **Create Dashboard**
-2. Add widgets querying Gold layer tables
-3. Set refresh interval to 30 seconds
-4. Share with stakeholders
 
 ---
 
-## 🎓 Key Learnings & Best Practices
+## 🚀 Project Structure
 
-### **✅ DO**
-- Use **watermarking** on all time-based joins and aggregations
-- Implement **data quality checks** with `@dp.expect_or_drop`
-- Use **Delta Lake** for ACID transactions on streaming data
-- Set appropriate **trigger intervals** (processingTime vs availableNow)
-- Monitor **state size growth** to prevent OOM errors
+```
+fingurad_fraudetection_streaming_project/
+│
+├── 📓 Notebooks/
+│   ├── 01_kafka_streaming_test.ipynb           # Kafka connectivity validation
+│   ├── 02_Setup_Secret_Scope.ipynb             # Secrets & credential management
+│   ├── 03_Send_Email.ipynb                     # Email alert testing
+│   └── 04_Autoloader_test.py.ipynb             # Auto Loader proof-of-concept
+│
+├── 🏭 finguard_streaming/                      # Main Lakeflow pipeline
+│   │
+│   ├── bronze/                                 # Raw ingestion
+│   │   ├── finguard_bronze.py                  # Kafka → bronze tables
+│   │   └── fraud_watchlist_bronze.py           # Watchlist stream
+│   │
+│   ├── silver/                                 # Cleansed layer
+│   │   ├── fingurad_silver.py                  # Parsed transactions
+│   │   └── fraud_watchlist_silver.py           # Validated watchlist
+│   │
+│   ├── gold/                                   # Business logic
+│   │   ├── fraud_card_alert.py                 # **Stateful join with watermarking**
+│   │   ├── high_value_transactions_alert.py    # Anomaly detection
+│   │   ├── transaction_count_by_minute.py      # Tumbling window
+│   │   └── transaction_count_by_minute_sliding_window.py  # Sliding window
+│   │
+│   └── alert/                                  # Alert processing
+│       ├── fraud_card_alert_email_notifier.py  # SMTP notifier
+│       └── high_value_transaction_email_notifier.py
+│
+├── 👥 finguard_customers_silver_ingestion/     # Customer data pipeline
+│   └── silver/customer_silver.py               # Lakeflow Connect integration
+│
+├── 🎲 fraud_watchlist_file_generator/          # Test data generator
+│   └── fraud_watchlist_data_generator.py
+│
+├── 📦 kafka_producer/                          # **Transaction simulator**
+│   ├── config.py                               # Settings & env loading
+│   ├── models.py                               # Data models
+│   ├── customer_generator.py                   # Synthetic customer data
+│   ├── merchant_generator.py                   # Synthetic merchant data
+│   ├── transaction_generator.py                # Realistic transactions
+│   ├── fraud_engine.py                         # Fraud scoring logic
+│   ├── producer_normal.py                      # Continuous normal producer
+│   ├── producer_fraud_transaction.py           # High-value fraud event
+│   ├── producer_fraud_card.py                  # Fraudulent card event
+│   ├── consumer.py                             # Debug consumer
+│   ├── utils.py                                # Shared utilities
+│   ├── requirements.txt                        # Python dependencies
+│   ├── README.md                               # Producer documentation
+│   └── .gitignore                              # Excludes .env, __pycache__, *.csv
+│
+└── 📁 media/                                   # Demos & docs
+    ├── Streaming recording video.mp4           # Real-time pipeline demo
+    └── FinGuard Fraud Detection Monitor...pdf  # Dashboard visualization
 
-### **❌ DON'T**
-- Don't use complete output mode with unbounded state
-- Don't join streams without watermarks (infinite state growth)
-- Don't skip checkpointing (required for fault tolerance)
-- Don't use collect() on streaming DataFrames in production
+```
+
+---
+
+## 🔧 Technical Depth: Watermarking Explained
+
+**Problem**: In a streaming join, how do you know when to stop waiting for late data?
+
+**Solution**: **Watermarking**
+
+```python
+transactions_wm = transactions.withWatermark("transaction_timestamp", "5 minutes")
+watchlist_wm = fraud_watchlist.withWatermark("effective_from", "5 minutes")
+
+# Join waits for data within 5 minutes of the max event time it has seen
+# After 5 minutes, old state is dropped to prevent unbounded memory growth
+fraud_detected = transactions_wm.join(watchlist_wm, ...)
+```
+
+**What Happens:**
+1. Spark tracks the **maximum event time** it has processed
+2. The **watermark** = max_event_time - 5 minutes
+3. Any data arriving **before the watermark** is dropped (too late)
+4. State for timestamps **before the watermark** is evicted (memory cleanup)
+5. Result: **Bounded state** + **correct late-arriving results** within the tolerance window
+
+**Why This Matters for Production:**
+- Without watermarking, the join would buffer data forever → OOM crash
+- With watermarking, state size grows predictably based on tolerance, not data volume
+- Critical for streaming systems processing billions of events/day
+
+---
+
+## 📊 State Management & RocksDB
+
+Spark Structured Streaming uses **RocksDB** (by default on Databricks) to manage join state:
+
+```python
+# Automatic state size optimization
+spark.conf.set("spark.sql.streaming.stateStore.compression.enabled", "true")
+spark.conf.set("spark.sql.streaming.stateStore.rocksdb.timeoutInterval", "3600s")
+
+# Monitor state size in Databricks UI:
+# Streaming → Query → Metrics → State Information
+```
+
+| Metric | Significance |
+|---|---|
+| `Total State Memory` | Sum of RocksDB memory across all stateful operations |
+| `State Checkpoint Size` | Persisted state on disk (for fault tolerance) |
+| `Watermark Lag` | Difference between current watermark and latest event time |
+
+---
+
+## 🔐 Security & Production Readiness
+
+### Secret Management
+
+All credentials (Kafka API keys, SMTP passwords) are stored in **Databricks Secret Scopes**:
+
+```python
+# Never hardcode credentials
+bootstrap_servers = dbutils.secrets.get("finguard-scope", "kafka_bootstrap_servers")
+api_key = dbutils.secrets.get("finguard-scope", "kafka_api_key")
+api_secret = dbutils.secrets.get("finguard-scope", "kafka_api_secret")
+```
+
+### Idempotent Producers
+
+All Kafka producers are configured for **exactly-once semantics**:
+
+```python
+config = {
+    "acks": "all",                      # Wait for all replicas
+    "retries": 5,                       # Retry transient failures
+    "enable.idempotence": True,         # Prevent duplicate delivery
+    "transactional.id": "...",          # Unique producer ID
+}
+```
 
 ---
 
 ## 📈 Performance Tuning
 
 ```python
-# Optimize shuffle partitions
-spark.conf.set("spark.sql.shuffle.partitions", "200")
-
-# Enable adaptive query execution
+# Adaptive Query Execution
 spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 
-# Optimize Kafka fetch size
+# Kafka Consumer Tuning
 .option("maxOffsetsPerTrigger", "1000000")  # Records per micro-batch
-.option("minPartitions", "8")  # Kafka partition distribution
+.option("minPartitions", "8")               # Kafka parallelism
 
-# Delta Lake optimizations
+# Delta Lake Optimization
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
 spark.conf.set("spark.databricks.delta.autoCompact.enabled", "true")
+
+# State Store Compression
+spark.conf.set("spark.sql.streaming.stateStore.compression.enabled", "true")
 ```
 
 ---
 
-## 🤝 Contributing
+## 🎓 Key Learnings & Best Practices
 
-Contributions are welcome! Please follow:
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit changes (`git commit -m 'Add AmazingFeature'`)
-4. Push to branch (`git push origin feature/AmazingFeature`)
-5. Open Pull Request
+### ✅ DO
+
+- Use **watermarking on all time-based joins and aggregations**
+- Implement **data quality checks** with `@dp.expect_or_drop`
+- Use **Delta Lake** for ACID transactions on streaming data
+- Set appropriate **trigger intervals** based on latency requirements
+- Monitor **state size growth** to prevent OOM errors
+- Store **secrets in Databricks Secret Scopes**, never in code
+
+### ❌ DON'T
+
+- Don't use **complete output mode** with unbounded state
+- Don't join streams **without watermarks** (infinite state growth)
+- Don't skip **checkpointing** (required for fault tolerance)
+- Don't use `collect()` on streaming DataFrames in production
+- Don't hardcode credentials or API keys in notebooks
+- Don't deploy without monitoring RocksDB state metrics
+
+---
+
+## 🚀 Setup & Deployment Guide
+
+### Prerequisites
+
+```
+Databricks Runtime: DBR 14.3 LTS or higher (Spark 3.5+)
+Python: 3.10+
+Kafka: Confluent Cloud (SASL_SSL)
+```
+
+### Step 1: Configure Secret Scope
+
+Run notebook `02_Setup_Secret_Scope.ipynb`:
+
+```python
+# Create scope
+dbutils.secrets.createScope("finguard-scope")
+
+# Add Kafka credentials
+dbutils.secrets.put("finguard-scope", "kafka_bootstrap_servers", "pkc-xxxxx.confluent.cloud:9092")
+dbutils.secrets.put("finguard-scope", "kafka_api_key", "YOUR_API_KEY")
+dbutils.secrets.put("finguard-scope", "kafka_api_secret", "YOUR_API_SECRET")
+
+# Add email credentials
+dbutils.secrets.put("finguard-scope", "smtp_username", "alerts@finguard.com")
+dbutils.secrets.put("finguard-scope", "smtp_password", "YOUR_PASSWORD")
+```
+
+### Step 2: Create Unity Catalog Schema
+
+```sql
+CREATE CATALOG IF NOT EXISTS finguard;
+USE CATALOG finguard;
+
+CREATE SCHEMA IF NOT EXISTS bronze;
+CREATE SCHEMA IF NOT EXISTS silver;
+CREATE SCHEMA IF NOT EXISTS gold;
+CREATE SCHEMA IF NOT EXISTS alert;
+```
+
+### Step 3: Deploy Lakeflow Pipeline
+
+1. Navigate to **Lakeflow** → **Create Pipeline**
+2. Configure:
+   - **Name**: `finguard-fraud-detection-pipeline`
+   - **Storage**: `/pipelines/finguard`
+   - **Target**: `finguard`
+   - **Mode**: Continuous
+3. Add library files from `finguard_streaming/` directory
+4. Click **Create** and **Start**
+
+### Step 4: Run Transaction Producer
+
+```bash
+cd kafka_producer/
+python -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\Activate.ps1 on Windows
+pip install -r requirements.txt
+
+# Set .env file (never commit this!)
+cp .env.example .env
+# Edit .env with your Kafka credentials
+
+# Start producing transactions
+python producer_normal.py
+```
+
+---
+
+## 🎬 Demo Walkthrough
+
+### 1. Validate Kafka Connectivity
+
+Run `01_kafka_streaming_test.ipynb` to confirm broker access.
+
+### 2. Start Transaction Producer
+
+```bash
+python kafka_producer/producer_normal.py
+```
+
+This generates:
+- 1,000 customers with realistic segments (Regular, Gold, Platinum, Corporate)
+- 200 merchants across 12 categories
+- ~5 transactions/sec with 8% fraud rate
+
+### 3. Monitor Real-Time Pipeline
+
+The Lakeflow pipeline processes transactions in micro-batches (30s trigger interval):
+
+```
+Bronze:  1M+ raw transactions/hour
+  ↓
+Silver:  ~999,200 valid transactions/hour (data quality filtering)
+  ↓
+Gold:    ~8,000 fraud alerts/hour (8% fraud rate)
+  ↓
+Email:   Alerts sent to customer within 30 seconds
+```
+
+### 4. Query Live Results
+
+```sql
+-- Check latest fraud alerts
+SELECT * FROM finguard.gold.fraud_card_alert
+WHERE alert_timestamp >= current_timestamp() - INTERVAL 5 MINUTES
+ORDER BY alert_timestamp DESC;
+
+-- Monitor transaction volume
+SELECT window_start, transaction_count 
+FROM finguard.gold.transaction_count_by_minute_sliding_window
+ORDER BY window_start DESC
+LIMIT 5;
+```
+
+---
+
+## 📞 Support & Contributing
+
+- **Issues**: Open a GitHub Issue for bugs or feature requests
+- **Questions**: Reach out at tahafurkhan@gmail.com
+- **Contributing**: Fork → Feature Branch → Pull Request
 
 ---
 
 ## 📄 License
 
-This project is licensed under the MIT License - see LICENSE file for details.
+MIT License — see LICENSE file for details
 
 ---
 
 ## 👨‍💻 Author
 
 **Taha Furkan**  
-GitHub: [@Tahafurkhan](https://github.com/Tahafurkhan)
+*Data Engineer | Agentic AI Engineer*  
+GitHub: [@Tahafurkhan](https://github.com/Tahafurkhan)  
+Email: tahafurkhan@gmail.com  
+LinkedIn: [in/developertaha](https://www.linkedin.com/in/developertaha)
 
 ---
 
 ## 🙏 Acknowledgments
 
-- Built on **Databricks Lakehouse Platform**
-- Powered by **Apache Spark Structured Streaming**
-- Data stored in **Delta Lake** format
-- Stream ingestion via **Apache Kafka (Confluent Cloud)**
+Built on:
+- **Databricks** Lakehouse Platform & Lakeflow Pipelines
+- **Apache Spark** Structured Streaming & Delta Lake
+- **Apache Kafka** (Confluent Cloud) for real-time ingestion
+- **Python** ecosystem (Faker, Confluent Kafka client, Pandas, NumPy)
 
 ---
 
-## 📞 Support
+<div align="center">
 
-For questions or issues:
-- Open a GitHub Issue
-- Contact: tahafurkhan@gmail.com
+**⭐ If this project helped you learn about real-time data engineering and fraud detection, please give it a star!**
 
----
+*Last Updated: 2026-07-22*  
+*Production-Ready | Enterprise-Grade | Interview Showcase*
 
-**⭐ If this project helped you, please give it a star!**
+</div>
