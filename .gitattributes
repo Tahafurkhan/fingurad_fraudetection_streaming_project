@@ -1,0 +1,17 @@
+# Large binary files
+*.mp4 binary
+*.pdf binary
+*.mov binary
+*.avi binary
+*.mkv binary
+
+# Git LFS (optional: uncomment if using Git LFS for large file storage)
+# *.mp4 filter=lfs diff=lfs merge=lfs -text
+# *.pdf filter=lfs diff=lfs merge=lfs -text
+
+# Python
+*.py diff=python
+*.pyw diff=python
+
+# CSV
+*.csv diff=csv
