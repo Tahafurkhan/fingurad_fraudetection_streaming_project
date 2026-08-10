@@ -18,16 +18,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
 import configparser
-import json
 import os
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import load_settings
 from merchant_generator import MerchantGenerator
+
+from config import load_settings
 
 VOLUME_PATH = "/Volumes/finguard/source/merchants/source_data"
 

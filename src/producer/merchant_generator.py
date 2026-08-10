@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pandas as pd
 from faker import Faker
-
 from models import Merchant
 from utils import ensure_parent_dir, generate_id
 

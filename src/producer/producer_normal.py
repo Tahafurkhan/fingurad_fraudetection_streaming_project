@@ -5,16 +5,15 @@ import logging
 import random
 import signal
 import time
-from pathlib import Path
 
 from confluent_kafka import Producer
-
-from config import Settings, load_settings
 from customer_generator import CustomerGenerator
-from merchant_generator import MerchantGenerator
 from fraud_engine import FraudEngine
+from merchant_generator import MerchantGenerator
 from transaction_generator import TransactionGenerator
 from utils import validate_json_payload
+
+from config import Settings, load_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

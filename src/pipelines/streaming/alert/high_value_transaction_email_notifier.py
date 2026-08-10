@@ -1,15 +1,16 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 from pyspark import pipelines as dp
 from pyspark.sql.dataframe import DataFrame
-from pyspark.sql import functions as F
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+
 
 def send_alert_email(records_list, gmail_api_key):
     """Send email with high-value transaction alerts"""
     FROM_EMAIL = "tahafurkhan@gmail.com"
     TO_EMAIL = "tahafurkhan@gmail.com"
-    
+
     # Build transaction table
     transaction_rows = ""
     for rec in records_list:
@@ -25,7 +26,7 @@ def send_alert_email(records_list, gmail_api_key):
             <td style="padding: 10px;">{rec['transaction_timestamp']}</td>
         </tr>
         """
-    
+
     body = f"""
     <html>
     <head>
@@ -65,15 +66,15 @@ def send_alert_email(records_list, gmail_api_key):
     </body>
     </html>
     """
-    
+
     subject = f"⚠️ High Value Transaction Alert - {len(records_list)} Transaction(s)"
-    
+
     msg = MIMEMultipart()
     msg["From"] = FROM_EMAIL
     msg["To"] = TO_EMAIL
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "html"))
-    
+
     try:
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
@@ -88,7 +89,7 @@ def send_alert_email(records_list, gmail_api_key):
 def process_alerts(df, batch_id):
     """Process each micro-batch and send email notifications"""
     records = df.collect()
-    
+
     if len(records) > 0:
         try:
             from pyspark.dbutils import DBUtils
@@ -97,7 +98,7 @@ def process_alerts(df, batch_id):
         except Exception as e:
             print(f"⚠️ Could not retrieve Gmail API key: {e}")
             return
-        
+
         # Convert to simple dictionaries
         records_list = []
         for row in records:
@@ -113,7 +114,7 @@ def process_alerts(df, batch_id):
                 'country': row.country,
                 'transaction_timestamp': str(row.transaction_timestamp)
             })
-        
+
         send_alert_email(records_list, gmail_api_key)
     else:
         print("ℹ️ No high-value transactions in this batch.")

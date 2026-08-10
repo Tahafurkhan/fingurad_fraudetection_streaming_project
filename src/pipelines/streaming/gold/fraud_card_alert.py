@@ -1,6 +1,6 @@
 from pyspark import pipelines as dp
-from pyspark.sql.dataframe import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.dataframe import DataFrame
 
 
 @dp.table(
@@ -26,12 +26,12 @@ def fraud_card_alert() -> DataFrame:
                 transactions_with_watermark.customer_id==customers.customer_id,
                 "left"
             ).select(
-                
+
                 # Alert identification
             F.concat_ws("-", F.lit("FRAUD"), F.col("transaction_id"), F.col("watchlist_id")).alias("alert_id"),
             F.lit("FRAUD_WATCHLIST_MATCH").alias("alert_type"),
             F.current_timestamp().alias("alert_timestamp"),
-            
+
             # Transaction details
             transactions_with_watermark.transaction_id,
             transactions_with_watermark.customer_id,
@@ -51,7 +51,7 @@ def fraud_card_alert() -> DataFrame:
             transactions_with_watermark.transaction_timestamp,
             transactions_with_watermark.is_international,
             transactions_with_watermark.status.alias("transaction_status"),
-            
+
             # Fraud watchlist details
             F.col("watchlist_id"),
             F.col("watch_type"),

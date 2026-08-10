@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, timezone
-from typing import Any
 
 import numpy as np
-import pandas as pd
-
 from fraud_engine import FraudEngine
 from models import Customer, Merchant, Transaction
 from utils import generate_id, utc_now_iso
@@ -100,7 +96,11 @@ class TransactionGenerator:
             "Corporate": ["Fuel", "Travel", "Restaurant", "Hotel"],
         }
         preferred_categories = category_preferences.get(customer.customer_segment, ["Shopping"])
-        merchants_in_pref = [merchant for merchant in self.merchants if merchant.merchant_category in preferred_categories]
+        merchants_in_pref = [
+            merchant
+            for merchant in self.merchants
+            if merchant.merchant_category in preferred_categories
+        ]
         return self.random.choice(merchants_in_pref)
 
     def _is_international_transaction(self, customer: Customer, merchant: Merchant) -> bool:

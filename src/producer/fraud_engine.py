@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Deque
 
 from models import Transaction
 
@@ -14,7 +13,7 @@ class FraudEngine:
     def __init__(self, fraud_percentage: float, seed: int) -> None:
         self.fraud_percentage = fraud_percentage
         self.random = random.Random(seed)
-        self.customer_history: dict[str, Deque[Transaction]] = {}
+        self.customer_history: dict[str, deque[Transaction]] = {}
         self._reason_weights = {
             "HIGH_VALUE_TRANSACTION": 40,
             "IMPOSSIBLE_TRAVEL": 50,

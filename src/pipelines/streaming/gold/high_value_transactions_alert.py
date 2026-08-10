@@ -1,8 +1,9 @@
 from pyspark import pipelines as dp
-from pyspark.sql.dataframe import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
+
 
 @dp.table(
     name="finguard.gold.high_value_transactions_alert",
@@ -18,7 +19,7 @@ def high_value_transactions_alert() -> DataFrame:
                     F.concat_ws("-",F.lit("ALERT"),F.col("transaction_id")).alias("alert_id"),
                     F.lit("HIGH_VALUE_TRANSACTION").alias("alert_type"),
                     F.current_timestamp().alias("alert_timestamp"),
-              
+
                     transactions.transaction_id,
                     transactions.customer_id,
                     customers.email.alias("customer_email"),
@@ -34,7 +35,7 @@ def high_value_transactions_alert() -> DataFrame:
                     transactions.country,
                     transactions.is_international,
                     transactions.transaction_timestamp,
-                    transactions.status 
+                    transactions.status
                 )
             )
     return joined_df

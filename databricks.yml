@@ -1,0 +1,57 @@
+# Databricks Asset Bundle.
+#
+# This replaces the ad-hoc sync script that pushed files to the workspace. The
+# difference is not convenience -- it is that a bundle *reconciles* state while
+# a sync script only adds to it. Deleting a file locally previously left the
+# old copy in the workspace, which caused a duplicate-table failure when two
+# files defined finguard.bronze.fraud_watchlist. `bundle deploy` removes what
+# is no longer declared.
+#
+# Usage:
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run finguard_pipeline -t dev
+
+bundle:
+  name: finguard
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for all pipeline output.
+    default: finguard
+
+  notifications_email:
+    description: Address that receives job failure notifications.
+    default: tahafurkhan@gmail.com
+
+targets:
+  # Development. Deploys to the user's own workspace path with resources
+  # prefixed by username, so two developers never collide.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-66c31e7b-a4f0.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: finguard
+
+  # Production. `mode: production` makes the deployment strict: it refuses to
+  # deploy if the local tree differs from what is committed, and it removes the
+  # dev-mode resource prefixes so table and job names are stable.
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-66c31e7b-a4f0.cloud.databricks.com
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: finguard
+    # Production resources are owned by a service principal in a real
+    # deployment. Left as the current user here because this workspace has no
+    # service principal provisioned -- stating that plainly rather than
+    # pretending otherwise.
+    run_as:
+      user_name: tahafurkhan@gmail.com

@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
 from faker import Faker
-
 from models import Customer
 from utils import ensure_parent_dir, generate_id
 

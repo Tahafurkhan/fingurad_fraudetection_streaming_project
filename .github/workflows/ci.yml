@@ -1,0 +1,134 @@
+name: CI
+
+# Runs on every PR and on pushes to main. The jobs here are ordered by how
+# fast they fail: secret scanning and linting need no credentials and finish in
+# seconds, so they gate the slower dbt jobs that need a warehouse.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  # Secret scanning first, always. This repository previously had a Confluent
+  # API key, a Gmail app password and a printed PAT committed in a notebook and
+  # pushed publicly. Rotation was the only remedy, because git history keeps
+  # what a later edit removes. This job is the control that stops it recurring.
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret added and then removed in a later commit is
+          # still exposed, and a shallow clone would miss it.
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        # Rules and per-file exemptions live in pyproject.toml, so this runs
+        # the same checks locally and in CI.
+        #
+        # `ruff format --check` is deliberately absent. The existing streaming
+        # models and producer predate this config, and reformatting working
+        # Spark code to satisfy a formatter is churn with real regression risk.
+        # New code is written to the style; old code is not rewritten for it.
+        run: ruff check src/ tests/
+
+  test-framework:
+    name: Test ingestion framework
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pytest pyyaml
+
+      - name: Run tests
+        # The framework is deliberately testable without a cluster: config
+        # loading, validation and closure binding are all pure Python.
+        run: pytest tests/ -v
+
+  validate-bundle:
+    name: Validate Asset Bundle
+    runs-on: ubuntu-latest
+    needs: [secret-scan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        run: databricks bundle validate -t dev
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+  dbt-build:
+    name: dbt build (changed models)
+    runs-on: ubuntu-latest
+    needs: [secret-scan, lint-python]
+    # Only on PRs: the point is to catch a broken model before it merges.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dbt
+        run: pip install dbt-databricks
+
+      - name: dbt deps
+        working-directory: transform
+        run: dbt deps
+
+      - name: dbt build
+        working-directory: transform
+        # `state:modified+` builds only what changed and everything downstream
+        # of it, rather than the whole project. On a small project the saving
+        # is minor; the habit is what matters, because a full build stops being
+        # viable long before anyone notices.
+        #
+        # Falls back to a full build when no previous manifest exists, since
+        # state comparison needs something to compare against.
+        run: |
+          if [ -d ../.dbt-state ]; then
+            dbt build --target ci --select state:modified+ --defer --state ../.dbt-state
+          else
+            echo "No previous state found; building everything."
+            dbt build --target ci
+          fi
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_HTTP_PATH: ${{ secrets.DATABRICKS_HTTP_PATH }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+      - name: Upload manifest for next run
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-manifest
+          path: transform/target/manifest.json

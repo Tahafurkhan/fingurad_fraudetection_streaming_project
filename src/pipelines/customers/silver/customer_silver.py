@@ -2,6 +2,7 @@ from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.dataframe import DataFrame
 
+
 @dp.table(
 name="finguard.silver.customers"
 ,comment="Parsed and cleaned customer data"

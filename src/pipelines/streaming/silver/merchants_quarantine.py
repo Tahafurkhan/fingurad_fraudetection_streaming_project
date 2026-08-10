@@ -1,6 +1,6 @@
 from pyspark import pipelines as dp
-from pyspark.sql.dataframe import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.dataframe import DataFrame
 
 # Quarantine for merchant rows that fail silver's drop rules.
 #

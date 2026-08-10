@@ -1,6 +1,7 @@
 from pyspark import pipelines as dp
-from pyspark.sql.dataframe import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.dataframe import DataFrame
+
 
 @dp.table(
 name="finguard.silver.fraud_watchlist"

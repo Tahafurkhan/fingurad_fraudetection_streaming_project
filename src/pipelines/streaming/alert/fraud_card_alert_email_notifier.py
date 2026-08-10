@@ -1,8 +1,8 @@
-from pyspark import pipelines as dp
-from pyspark.sql.dataframe import DataFrame
 import smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from pyspark import pipelines as dp
 
 
 def send_email(to_email, subject, body, from_email, app_password):
@@ -12,7 +12,7 @@ def send_email(to_email, subject, body, from_email, app_password):
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "html"))
-    
+
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
         server.login(from_email, app_password)
@@ -114,15 +114,15 @@ def send_fraud_alert_emails(df, batch_id):
         return
 
     print(f"🚨 Batch {batch_id}: Processing {len(rows)} fraud alert(s)...")
-    
+
     success_count = 0
     failure_count = 0
-    
+
     for row in rows:
         try:
             # Mask card number (show only last 4 digits)
             card_number_masked = str(row.card_number)[-4:] if row.card_number else "****"
-            
+
             alert_data = {
                 'alert_id': row.alert_id,
                 'alert_type': row.alert_type,
@@ -152,19 +152,19 @@ def send_fraud_alert_emails(df, batch_id):
                 'watchlist_country': row.watchlist_country if row.watchlist_country else 'N/A',
                 'watchlist_effective_from': str(row.watchlist_effective_from)
             }
-            
+
             subject = f"🚨 FRAUD ALERT - {alert_data['risk_level']} Risk - {alert_data['alert_id']}"
             body = create_fraud_alert_email_body(alert_data)
-            
+
             send_email(row.customer_email, subject, body, EMAIL_FROM, app_password)
-            
+
             success_count += 1
             print(f"  ✅ Fraud alert email sent to {row.customer_email} for transaction {row.transaction_id}")
-            
+
         except Exception as e:
             failure_count += 1
             print(f"  ❌ Error processing fraud alert {row.alert_id}: {e}")
-    
+
     print(f"📊 Batch {batch_id} complete: {success_count} succeeded, {failure_count} failed")
 
 

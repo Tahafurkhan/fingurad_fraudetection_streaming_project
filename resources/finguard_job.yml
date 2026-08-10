@@ -1,0 +1,114 @@
+# End-to-end orchestration: ingest, then model, then verify.
+#
+# Without this, the Lakeflow pipeline and the dbt project are two things a
+# human runs in the right order and hopes nothing drifted. The dependency is
+# real -- dbt reads finguard.silver and finguard.gold, so running it against a
+# stale pipeline produces marts that look fine and are quietly wrong. Encoding
+# the order here is the difference between a scheduled platform and a set of
+# scripts.
+
+resources:
+  jobs:
+    finguard_daily:
+      name: finguard_daily_pipeline
+
+      schedule:
+        # 02:00 IST daily. Chosen because the transaction simulator runs during
+        # the day, so an overnight run sees a complete day rather than a
+        # partial one.
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: Asia/Kolkata
+        pause_status: PAUSED
+
+      # One run at a time. Two concurrent runs would have dbt reading tables
+      # another run is mid-write on.
+      max_concurrent_runs: 1
+
+      email_notifications:
+        on_failure:
+          - ${var.notifications_email}
+
+      # dbt tasks need somewhere to run the dbt process itself, separately from
+      # the SQL warehouse that executes the generated SQL. A serverless
+      # environment avoids defining and paying for a job cluster that would sit
+      # idle between the short dbt invocations.
+      environments:
+        - environment_key: dbt_env
+          spec:
+            client: "3"
+            dependencies:
+              - dbt-databricks>=1.12.0,<2.0.0
+
+      tasks:
+        # 1. Ingest. Bronze and silver from Kafka, volumes and CDC; streaming
+        #    gold alerts computed in the same update.
+        - task_key: ingest_streaming
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.finguard_pipeline.id}
+            full_refresh: false
+
+        # 2. Customer silver, independent of the Kafka path.
+        - task_key: ingest_customers
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.finguard_customers_pipeline.id}
+            full_refresh: false
+
+        # 3. Snapshots BEFORE models. This ordering is load-bearing: snapshots
+        #    capture the current state of mutable dimensions, and running them
+        #    after the models would mean the dimensions are built from
+        #    yesterday's snapshot while the facts use today's data.
+        - task_key: dbt_snapshot
+          depends_on:
+            - task_key: ingest_streaming
+            - task_key: ingest_customers
+          environment_key: dbt_env
+          dbt_task:
+            project_directory: ../transform
+            profiles_directory: ../transform
+            commands:
+              - "dbt deps"
+              - "dbt snapshot --target ${bundle.target}"
+            warehouse_id: b349348047ac54a2
+
+        # 4. Build the marts.
+        - task_key: dbt_run
+          depends_on:
+            - task_key: dbt_snapshot
+          environment_key: dbt_env
+          dbt_task:
+            project_directory: ../transform
+            profiles_directory: ../transform
+            commands:
+              - "dbt run --target ${bundle.target}"
+            warehouse_id: b349348047ac54a2
+
+        # 5. Test last, as a gate. Tests that run before the models they check
+        #    are decoration; running them here means a failure is a real signal
+        #    that something downstream should not be trusted.
+        - task_key: dbt_test
+          depends_on:
+            - task_key: dbt_run
+          environment_key: dbt_env
+          dbt_task:
+            project_directory: ../transform
+            profiles_directory: ../transform
+            commands:
+              - "dbt test --target ${bundle.target}"
+            warehouse_id: b349348047ac54a2
+
+        # 6. Source freshness, non-blocking. A stale source is worth knowing
+        #    about but is not a reason to fail a run that otherwise succeeded --
+        #    it usually means an upstream system is quiet, not that this
+        #    pipeline is broken.
+        - task_key: dbt_source_freshness
+          depends_on:
+            - task_key: dbt_test
+          environment_key: dbt_env
+          dbt_task:
+            project_directory: ../transform
+            profiles_directory: ../transform
+            commands:
+              - "dbt source freshness --target ${bundle.target}"
+            warehouse_id: b349348047ac54a2
+          # Freshness warnings should not mark the run failed.
+          disable_auto_optimization: true

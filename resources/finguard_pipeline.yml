@@ -1,0 +1,67 @@
+# Lakeflow Declarative Pipeline: bronze, silver, gold and alert sinks.
+#
+# Previously this pipeline was configured by hand in the UI, which meant the
+# glob paths lived only in the workspace and were invisible to code review.
+# When the repository was restructured the globs still pointed at the old
+# directories, and nothing in the codebase revealed that. Declaring the
+# pipeline here makes the source paths part of the diff.
+
+resources:
+  pipelines:
+    finguard_pipeline:
+      name: finguard_streaming
+      catalog: ${var.catalog}
+      # Default publishing schema. Each dataset fully qualifies its own target
+      # (finguard.silver.transactions and so on), so this is only the fallback.
+      schema: bronze
+
+      serverless: true
+      # Triggered rather than continuous: this runs at portfolio scale and
+      # continuous mode would hold compute open indefinitely. Switch to
+      # continuous when latency matters more than cost.
+      continuous: false
+      development: true
+
+      libraries:
+        - glob:
+            include: ../src/pipelines/streaming/bronze/**
+        - glob:
+            include: ../src/pipelines/streaming/silver/**
+        - glob:
+            include: ../src/pipelines/streaming/gold/**
+        - glob:
+            include: ../src/pipelines/streaming/alert/**
+
+      configuration:
+        # Made available to pipeline code via spark.conf, so the catalog is not
+        # hardcoded in the Python.
+        finguard.catalog: ${var.catalog}
+
+      notifications:
+        - email_recipients:
+            - ${var.notifications_email}
+          alerts:
+            - on-update-failure
+            - on-flow-failure
+
+    # Customer silver ingestion runs as its own pipeline. Separate because it
+    # is fed by the managed Postgres CDC pipeline rather than by Kafka, so a
+    # Kafka outage should not block customer updates -- blast radius bounded by
+    # dependency rather than by convenience.
+    finguard_customers_pipeline:
+      name: finguard_customers_silver_ingestion
+      catalog: ${var.catalog}
+      schema: silver
+      serverless: true
+      continuous: false
+      development: true
+
+      libraries:
+        - glob:
+            include: ../src/pipelines/customers/silver/**
+
+      notifications:
+        - email_recipients:
+            - ${var.notifications_email}
+          alerts:
+            - on-update-failure

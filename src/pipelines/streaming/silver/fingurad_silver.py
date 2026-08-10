@@ -1,9 +1,10 @@
+
 from pyspark import pipelines as dp
-from pyspark.sql.dataframe import DataFrame
-import json
-from pyspark.sql.functions import col
 from pyspark.sql import functions as F
+from pyspark.sql.dataframe import DataFrame
+from pyspark.sql.functions import col
 from pyspark.sql.types import *
+
 
 @dp.table(
 name="finguard.silver.transactions"
@@ -16,7 +17,7 @@ name="finguard.silver.transactions"
 @dp.expect("valid_amount","amount > 0")
 def transactions_silver() -> DataFrame:
     bronze_df=spark.readStream.table("finguard.bronze.transactions")
-    
+
     schema = StructType([
         StructField("transaction_id", StringType()),
         StructField("customer_id", StringType()),
@@ -52,5 +53,5 @@ def transactions_silver() -> DataFrame:
         ,F.col("bronze_ingestion_timestamp")
         ,F.current_timestamp().alias("silver_ingestion_timestamp")
     )
-    
+
     return tranformed_df

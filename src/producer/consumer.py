@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
-from typing import Any
 
 from confluent_kafka import Consumer, KafkaException
 

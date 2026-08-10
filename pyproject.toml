@@ -1,0 +1,44 @@
+[tool.ruff]
+# 120 rather than the 88/100 default. The existing streaming models and
+# producer were written at this width, and reformatting working Spark code to
+# satisfy a linter is churn with real regression risk and no functional gain.
+line-length = 120
+target-version = "py310"
+
+exclude = [
+    ".venv",
+    "transform/dbt_packages",
+    "transform/target",
+    "notebooks",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+# Databricks injects `spark` and `dbutils` as module globals into pipeline
+# files, so undefined-name warnings are expected there. Suppressing per-file
+# rather than globally keeps the check active everywhere else.
+[tool.ruff.lint.per-file-ignores]
+"src/pipelines/streaming/**" = ["F821"]
+"src/pipelines/customers/**" = ["F821"]
+
+# The alert notifiers build HTML email bodies as long f-strings. Wrapping them
+# to satisfy the line limit would make the markup harder to read, not easier.
+"src/pipelines/streaming/alert/*" = ["F821", "E501"]
+
+# Two streaming models use `from pyspark.sql.functions import *` and
+# `from pyspark.sql.types import *`, inherited from the original
+# implementation. Exempted rather than rewritten: changing a working streaming
+# model to satisfy a linter risks its behaviour for no functional gain. Worth
+# fixing deliberately as its own change, not as lint churn.
+"src/pipelines/streaming/gold/high_value_transactions_alert.py" = [
+    "F821",
+    "F403",
+    "F405",
+]
+"src/pipelines/streaming/silver/fingurad_silver.py" = ["F821", "F403", "F405"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
