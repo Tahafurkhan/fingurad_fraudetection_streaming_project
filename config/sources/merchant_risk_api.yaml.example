@@ -1,0 +1,62 @@
+# Merchant risk enrichment from an external REST API.
+#
+# STATUS: template, not active. Rename to merchant_risk_api.yaml (dropping
+# .example) once a real endpoint exists; the generator only loads *.yaml, so
+# this file is inert until then.
+#
+# The pattern this demonstrates: real fraud platforms do not own every risk
+# signal. Merchant reputation, sanctions status and device intelligence are
+# typically bought from vendors and pulled over HTTP on a schedule. That is a
+# genuinely different ingestion shape from Kafka or Auto Loader -- pagination,
+# bearer auth, retry/backoff, and a bounded result rather than a stream.
+#
+# Note this registers as a MATERIALISED VIEW, not a streaming table: a REST
+# pull returns a complete snapshot, so full recomputation each update is the
+# correct semantic. Streaming append would duplicate every row on every run.
+#
+# Deliberately NOT used for transactions: a 5 TPS event stream belongs on
+# Kafka, where ordering, replay from offset, and exactly-once semantics are
+# preserved. Polling REST for events would throw all three away.
+name: merchant_risk_api
+target: finguard.bronze.merchant_risk_scores
+comment: "Third-party merchant risk scores pulled from a vendor REST API"
+
+ingestion:
+  type: rest_api
+  url: https://api.example-riskvendor.com/v1/merchants/risk
+
+  # Credentials resolve from the Databricks secret scope at runtime. Store the
+  # token with:
+  #   databricks secrets put --scope finguard-scope --key merchant_risk_api_token
+  secret_scope: finguard-scope
+  secret_key: merchant_risk_api_token
+  auth_header: Authorization
+  auth_template: "Bearer {token}"
+
+  # Pagination. The reader stops when a page returns fewer than page_size
+  # records, or when max_pages is reached (a guard against a misbehaving
+  # endpoint paginating forever).
+  page_param: page
+  page_size_param: per_page
+  page_size: 250
+  max_pages: 200
+
+  # Where the record array lives in the response envelope, dotted.
+  # e.g. {"data": {"merchants": [...]}} -> "data.merchants"
+  records_path: data.merchants
+
+  # Transient-failure handling: 429 and 5xx retry with exponential backoff.
+  # Other 4xx fail immediately -- a malformed request will not fix itself.
+  max_retries: 3
+  timeout_seconds: 30
+
+  # Static query params sent on every request.
+  params:
+    country: IN
+
+columns:
+  - {name: merchant_id}
+  - {name: risk_score}
+  - {name: risk_band}
+  - {name: sanctions_flag}
+  - {name: last_reviewed_at}

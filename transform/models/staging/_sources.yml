@@ -1,0 +1,89 @@
+version: 2
+
+sources:
+  - name: silver
+    catalog: finguard
+    schema: silver
+    description: >
+      Cleaned, typed tables produced by Lakeflow Declarative Pipelines. dbt
+      reads these and never writes to them -- the boundary is that Lakeflow
+      owns bronze and silver, dbt owns marts.
+
+    tables:
+      - name: transactions
+        description: Card transactions, parsed from the Kafka payload and quality-checked.
+        # Freshness is measured against the silver write time rather than event
+        # time: the question is "is the pipeline still running?", not "are the
+        # events recent?". A stalled pipeline and a quiet Saturday look
+        # identical on event time.
+        loaded_at_field: silver_ingestion_timestamp
+        freshness:
+          warn_after: {count: 1, period: hour}
+          error_after: {count: 6, period: hour}
+        columns:
+          - name: transaction_id
+            description: Unique transaction identifier.
+            data_tests: [not_null]
+          - name: customer_id
+            data_tests: [not_null]
+          - name: merchant_id
+            data_tests: [not_null]
+          - name: amount
+            description: Transaction amount in the transaction currency.
+          - name: transaction_timestamp
+            description: Event time, used for windowing and point-in-time joins.
+
+      - name: merchants
+        description: >
+          Merchant master, deduplicated to one current row per merchant_id.
+          Each upload is a full snapshot, so bronze holds every observed state
+          and this table exposes the latest.
+        loaded_at_field: silver_ingestion_timestamp
+        # Merchant files land at most daily, so an hourly threshold would warn
+        # constantly. Thresholds must match delivery cadence or they get muted,
+        # and a muted alert is worse than none.
+        freshness:
+          warn_after: {count: 2, period: day}
+          error_after: {count: 7, period: day}
+        columns:
+          - name: merchant_id
+            data_tests:
+              - not_null
+              - unique
+          - name: merchant_risk
+            data_tests:
+              - accepted_values:
+                  values: ["LOW", "MEDIUM", "HIGH"]
+          - name: is_blacklisted
+            data_tests: [not_null]
+          - name: requires_review
+            description: Derived - HIGH risk or blacklisted.
+
+      - name: customers
+        description: >
+          Customer master, ingested from Postgres by CDC. Attributes are
+          mutable at source, which is what makes SCD2 history meaningful.
+        loaded_at_field: silver_ingestion_timestamp
+        freshness:
+          warn_after: {count: 1, period: day}
+          error_after: {count: 3, period: day}
+        columns:
+          - name: customer_id
+            data_tests: [not_null]
+          - name: customer_segment
+            description: Mutable - changes are tracked as SCD2 history.
+          - name: risk_score
+            description: Mutable - drives fraud evaluation at transaction time.
+
+      - name: fraud_watchlist
+        description: Entities flagged for fraud, with effective dating.
+        loaded_at_field: silver_ingestion_timestamp
+        freshness:
+          warn_after: {count: 1, period: day}
+          error_after: {count: 3, period: day}
+        columns:
+          - name: watchlist_id
+            data_tests: [not_null]
+          - name: entity_id
+            description: The flagged value - a card number for card watch types.
+            data_tests: [not_null]

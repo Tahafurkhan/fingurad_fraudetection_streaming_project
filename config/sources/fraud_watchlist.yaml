@@ -1,0 +1,35 @@
+# Fraud watchlist files landed into a Unity Catalog volume and picked up
+# incrementally by Auto Loader.
+#
+# inferColumnTypes is on because the upstream feed is JSON without a contract.
+# _rescued_data is carried through deliberately: it captures fields that do not
+# match the inferred schema, which is how schema drift becomes visible instead
+# of silently dropping data.
+name: fraud_watchlist
+target: finguard.bronze.fraud_watchlist
+comment: "Raw fraud watchlist entries ingested by Auto Loader"
+
+ingestion:
+  type: autoloader
+  path: /Volumes/finguard/source/fraud_watchlist/source_data/
+  format: json
+  options:
+    cloudFiles.inferColumnTypes: "true"
+
+columns:
+  - {name: watchlist_id}
+  - {name: watch_type}
+  - {name: entity_id}
+  - {name: risk_level}
+  - {name: action}
+  - {name: reason_code}
+  - {name: reason_description}
+  - {name: status}
+  - {name: effective_from}
+  - {name: reported_by}
+  - {name: reported_source}
+  - {name: country}
+  - {name: city}
+  - {name: _rescued_data}
+  # File provenance: which file each row came from, for auditing and replay.
+  - {name: source_file, expr: "_metadata.file_path"}

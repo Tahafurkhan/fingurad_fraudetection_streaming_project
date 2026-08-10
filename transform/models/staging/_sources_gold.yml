@@ -1,0 +1,55 @@
+version: 2
+
+sources:
+  - name: gold
+    catalog: finguard
+    schema: gold
+    description: >
+      Streaming gold, produced by Lakeflow. These tables are the operational
+      alerting path: stream-stream joins, stream-static joins and windowed
+      aggregates that fire in sub-minute latency and drive the email notifier.
+
+      dbt reads them and never writes to them. The boundary is that anything
+      needing streaming semantics -- watermarks, windows, stateful joins --
+      belongs to the pipeline; dbt owns dimensional modelling and historical
+      analysis on top.
+
+    tables:
+      - name: fraud_card_alert
+        description: >
+          Watchlist matches from a stream-stream join between transactions and
+          the fraud watchlist, watermarked five minutes on both sides.
+        loaded_at_field: alert_timestamp
+        freshness:
+          warn_after: {count: 6, period: hour}
+          error_after: {count: 24, period: hour}
+        columns:
+          - name: alert_id
+            data_tests: [not_null]
+          - name: transaction_id
+            data_tests: [not_null]
+          - name: risk_level
+            description: Watchlist risk level at match time.
+
+      - name: high_value_transactions_alert
+        description: >
+          Transactions exceeding the customer's configured limit, from a
+          stream-static join against silver.customers.
+        loaded_at_field: alert_timestamp
+        freshness:
+          warn_after: {count: 12, period: hour}
+          error_after: {count: 48, period: hour}
+        columns:
+          - name: alert_id
+            data_tests: [not_null]
+          - name: transaction_id
+            data_tests: [not_null]
+
+      - name: transaciton_count_by_minute
+        description: Tumbling one-minute transaction counts.
+        columns:
+          - name: window_start
+            data_tests: [not_null]
+
+      - name: transaciton_count_by_minute_sliding_window
+        description: Sliding-window transaction counts for velocity detection.

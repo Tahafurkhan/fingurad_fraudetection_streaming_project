@@ -1,0 +1,133 @@
+version: 2
+
+models:
+  - name: dim_merchant
+    description: >
+      Merchant dimension with SCD2 history. One row per merchant per version;
+      join facts on merchant_sk, not merchant_id.
+    columns:
+      - name: merchant_sk
+        description: Surrogate key - unique per merchant version.
+        data_tests:
+          - not_null
+          - unique
+      - name: merchant_id
+        description: Natural key - NOT unique, repeats across versions.
+        data_tests: [not_null]
+      - name: merchant_risk
+        data_tests:
+          - accepted_values:
+              values: ["LOW", "MEDIUM", "HIGH"]
+      - name: is_current
+        data_tests: [not_null]
+      - name: valid_from
+        data_tests: [not_null]
+      - name: valid_to
+        data_tests: [not_null]
+
+  - name: dim_customer
+    description: >
+      Customer dimension with SCD2 history on the attributes that drive fraud
+      evaluation: segment, risk score, city, transaction limit.
+    columns:
+      - name: customer_sk
+        data_tests:
+          - not_null
+          - unique
+      - name: customer_id
+        data_tests: [not_null]
+      - name: risk_band
+        data_tests:
+          - accepted_values:
+              values: ["LOW", "MEDIUM", "HIGH"]
+      - name: card_number_masked
+        description: Only the last four digits are exposed.
+      - name: is_current
+        data_tests: [not_null]
+
+  - name: dim_date
+    description: Generated calendar dimension covering 2024-2027.
+    columns:
+      - name: date_key
+        description: Integer surrogate key in yyyyMMdd form.
+        data_tests:
+          - not_null
+          - unique
+      - name: full_date
+        data_tests: [not_null, unique]
+      - name: is_weekend
+        data_tests: [not_null]
+
+  - name: fct_alerts
+    description: >
+      Alerts raised by the Lakeflow streaming pipeline, enriched with
+      point-in-time dimension context. Detection rules are NOT recomputed here
+      -- the streaming layer owns detection, this model owns analysis of it.
+    columns:
+      - name: alert_id
+        data_tests:
+          - not_null
+          - unique
+      - name: transaction_id
+        data_tests: [not_null]
+      - name: alert_type
+        data_tests:
+          - accepted_values:
+              values: ["FRAUD_WATCHLIST_MATCH", "HIGH_VALUE_TRANSACTION"]
+      - name: detection_latency_seconds
+        description: >
+          Seconds between transaction and alert. Measures the pipeline's real
+          SLA rather than an assumed one.
+      - name: transaction_timestamp
+        data_tests: [not_null]
+
+  - name: agg_daily_fraud_summary
+    description: Daily transaction and alert metrics by customer segment.
+    columns:
+      - name: transaction_date
+        data_tests: [not_null]
+      - name: transaction_count
+        data_tests: [not_null]
+      - name: alert_rate_pct
+        description: Alerts per hundred transactions.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - transaction_date
+            - customer_segment
+
+  - name: agg_merchant_risk_profile
+    description: >
+      Declared versus observed merchant risk. risk_rating_understated flags
+      merchants whose behaviour is worse than their rating suggests.
+    columns:
+      - name: merchant_id
+        data_tests:
+          - not_null
+          - unique
+      - name: observed_risk
+        data_tests:
+          - accepted_values:
+              values: ["LOW", "MEDIUM", "HIGH", "BLACKLISTED"]
+      - name: transaction_count
+        data_tests: [not_null]
+
+  - name: fct_transactions
+    description: >
+      Transaction fact, incremental. Dimension attributes are resolved as of
+      the transaction timestamp, not as of the current dimension state.
+    columns:
+      - name: transaction_id
+        data_tests:
+          - not_null
+          - unique
+      - name: customer_id
+        data_tests: [not_null]
+      - name: merchant_id
+        data_tests: [not_null]
+      - name: amount
+        description: Transaction amount; the pipeline drops non-positive values.
+      - name: transaction_timestamp
+        data_tests: [not_null]
+      - name: is_high_value
+        data_tests: [not_null]

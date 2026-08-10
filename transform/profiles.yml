@@ -1,0 +1,39 @@
+# dbt connection profile.
+#
+# No credentials are stored here. The token is read from the environment at
+# runtime, so this file is safe to commit and the same file works for every
+# developer and for CI.
+#
+# Required environment variables:
+#   DATABRICKS_HOST        e.g. dbc-xxxxxxxx-xxxx.cloud.databricks.com  (no https://)
+#   DATABRICKS_HTTP_PATH   e.g. /sql/1.0/warehouses/<warehouse-id>
+#   DATABRICKS_TOKEN       personal access token
+#
+# `databricks configure --token` writes host and token to ~/.databrickscfg;
+# these variables are separate and must be exported explicitly.
+
+finguard:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      catalog: finguard
+      schema: marts
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      # Serverless warehouses cold-start; give the first statement room.
+      connect_retries: 3
+      connect_timeout: 180
+      threads: 4
+
+    prod:
+      type: databricks
+      catalog: finguard
+      schema: marts
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      connect_retries: 3
+      connect_timeout: 180
+      threads: 8

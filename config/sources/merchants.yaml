@@ -1,0 +1,38 @@
+# Merchant master data.
+#
+# Why this source exists: fraud_engine.py already scores on `merchant_risk`
+# (HIGH_RISK_MERCHANT, weight 25) and `is_blacklisted` (BLACKLISTED_MERCHANT,
+# weight 60), but those attributes only ever existed denormalised inside each
+# transaction payload. There was no merchant table to join against, so there
+# was no way to answer "when did this merchant become high risk?" -- which is
+# exactly the question a fraud analyst asks.
+#
+# Promoting merchants to a first-class dimension makes merchant_risk and
+# is_blacklisted mutable attributes with history, which is what dim_merchant
+# (SCD2) is built from downstream.
+name: merchants
+target: finguard.bronze.merchants
+comment: "Merchant master data ingested by Auto Loader"
+
+ingestion:
+  type: autoloader
+  path: /Volumes/finguard/source/merchants/source_data/
+  format: csv
+  options:
+    cloudFiles.inferColumnTypes: "true"
+    # The generator writes a header row; without this the header becomes data.
+    header: "true"
+    # Surface unexpected columns rather than dropping them silently, matching
+    # how fraud_watchlist handles drift.
+    cloudFiles.schemaEvolutionMode: "rescue"
+
+columns:
+  - {name: merchant_id}
+  - {name: merchant_name}
+  - {name: merchant_category}
+  - {name: city}
+  - {name: country}
+  - {name: merchant_risk}
+  - {name: is_blacklisted}
+  - {name: _rescued_data}
+  - {name: source_file, expr: "_metadata.file_path"}

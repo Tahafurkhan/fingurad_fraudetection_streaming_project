@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / local config
+.env
+*.pem
+
+# dbt
+target/
+dbt_packages/
+logs/
+.user.yml
+
+# Databricks
+.databricks/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

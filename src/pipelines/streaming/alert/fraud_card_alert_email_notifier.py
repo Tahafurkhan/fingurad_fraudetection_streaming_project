@@ -87,24 +87,32 @@ This is an automated fraud alert from FinGuard Transaction Monitoring System.<br
 </body></html>"""
 
 
-# Get configuration outside the foreach_batch_sink for serialization
 EMAIL_FROM = "tahafurkhan@gmail.com"
-try:
-    APP_PASSWORD = dbutils().secrets().get("finguard-scope", "gmail_api_key")
-except Exception as e:
-    print(f"❌ Failed to retrieve Gmail API key from secrets: {e}")
-    APP_PASSWORD = None
 
 
 @dp.foreach_batch_sink(name="fraud_email_notifier_sink")
 def send_fraud_alert_emails(df, batch_id):
     """ForEachBatch sink that sends email alerts for fraud card transactions."""
-    
-    if APP_PASSWORD is None:
-        print(f"❌ Batch {batch_id}: Gmail API key not available, skipping email notifications")
-        return
-    
+
     rows = df.collect()
+
+    if not rows:
+        return
+
+    # Resolve the secret inside the batch function: `dbutils` is not a module
+    # global on serverless compute, so it has to be built from the active
+    # session. Doing it here (rather than at import time) also keeps the
+    # credential out of the closure that gets serialised to the executors.
+    try:
+        from pyspark.dbutils import DBUtils
+
+        app_password = DBUtils(df.sparkSession).secrets.get(
+            scope="finguard-scope", key="gmail_api_key"
+        )
+    except Exception as e:
+        print(f"❌ Batch {batch_id}: could not retrieve Gmail API key: {e}")
+        return
+
     print(f"🚨 Batch {batch_id}: Processing {len(rows)} fraud alert(s)...")
     
     success_count = 0
@@ -148,7 +156,7 @@ def send_fraud_alert_emails(df, batch_id):
             subject = f"🚨 FRAUD ALERT - {alert_data['risk_level']} Risk - {alert_data['alert_id']}"
             body = create_fraud_alert_email_body(alert_data)
             
-            send_email(row.customer_email, subject, body, EMAIL_FROM, APP_PASSWORD)
+            send_email(row.customer_email, subject, body, EMAIL_FROM, app_password)
             
             success_count += 1
             print(f"  ✅ Fraud alert email sent to {row.customer_email} for transaction {row.transaction_id}")

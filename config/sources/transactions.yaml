@@ -1,0 +1,29 @@
+# Card transaction stream from Confluent Cloud.
+#
+# The Kafka connection details (bootstrap servers, API key/secret, topic) live
+# in the Databricks secret scope rather than here, so this file stays safe to
+# commit. The pipeline reads the secret at runtime and parses it as JSON.
+name: transactions
+target: finguard.bronze.transactions
+comment: "Raw card transactions ingested from Kafka (Confluent Cloud)"
+
+ingestion:
+  type: kafka
+  secret_scope: finguard-scope
+  secret_key: kafka_connection_details
+  # earliest so a rebuilt table replays the full retention window; switch to
+  # latest only if you intend to skip history on reset.
+  starting_offsets: earliest
+  security_protocol: SASL_SSL
+  sasl_mechanism: PLAIN
+
+# Kafka payloads stay unparsed in bronze -- value is kept as a raw string and
+# the envelope fields are preserved so silver can replay or debug any offset.
+columns:
+  - {name: key, expr: "CAST(key AS STRING)"}
+  - {name: value, expr: "CAST(value AS STRING)"}
+  - {name: topic}
+  - {name: partition}
+  - {name: offset}
+  - {name: timestamp}
+  - {name: timestampType}

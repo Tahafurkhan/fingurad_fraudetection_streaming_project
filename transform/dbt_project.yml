@@ -1,0 +1,44 @@
+name: finguard
+version: "1.0.0"
+config-version: 2
+
+profile: finguard
+
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Boundary rule: Lakeflow owns bronze and silver, dbt owns marts. Nothing is
+# defined in both places. dbt reads silver as a source and never writes to it.
+models:
+  finguard:
+    staging:
+      # Views: staging is renaming and light typing, so materialising would
+      # duplicate silver for no benefit. Views keep the lineage honest and cost
+      # nothing to rebuild.
+      +materialized: view
+    marts:
+      +materialized: table
+
+# dbt's default generate_schema_name appends the model's schema config to the
+# target schema, producing `marts_marts`. The override in macros/ uses the
+# custom schema verbatim instead, so models land in `finguard.marts` as
+# configured in profiles.yml.
+
+snapshots:
+  finguard:
+    +target_schema: snapshots
+    # Delta supports MERGE, which is what dbt snapshots need to close out old
+    # versions and insert new ones in a single atomic statement.
+    +file_format: delta
+
+vars:
+  # Fraud-scoring threshold, referenced by marts rather than hardcoded per
+  # model so the rule lives in one place.
+  high_value_threshold: 100000

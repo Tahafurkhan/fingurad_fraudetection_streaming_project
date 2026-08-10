@@ -1,0 +1,36 @@
+{
+  "pipeline_name": "fingurad_ingestion",
+  "pipeline_id": "b1b8c9c5-c341-4a33-9d22-d3a98da1fa9e",
+  "pipeline_type": "MANAGED_INGESTION",
+  "description": "PostgreSQL ingestion pipeline for Finguard customer data",
+  "source": {
+    "type": "POSTGRESQL",
+    "connection_name": "finguard_connection",
+    "database": "neondb",
+    "schema": "public",
+    "tables": [
+      {
+        "source_table": "customers",
+        "destination_catalog": "finguard",
+        "destination_schema": "bronze",
+        "destination_table": "customers",
+        "primary_keys": [
+          "customer_id"
+        ],
+        "cursor_columns": [
+          "update_timestamp"
+        ],
+        "ingestion_mode": "query_based"
+      }
+    ]
+  },
+  "destination": {
+    "catalog": "finguard",
+    "schema": "bronze"
+  },
+  "settings": {
+    "channel": "PREVIEW"
+  },
+  "owner": "tahafurkhan@gmail.com",
+  "created_date": "2026-07-13"
+}
