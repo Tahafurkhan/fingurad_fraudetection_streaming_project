@@ -133,3 +133,91 @@ def test_missing_directory_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         load_source_configs(tmp_path / "does_not_exist")
+
+
+# --- Physical layout declarations ------------------------------------------
+#
+# Optimization settings live in config so a new source arrives with its file
+# management already decided. These tests exist because a mis-declared layout
+# fails at table-creation time, deep inside a pipeline update, with a message
+# that does not name the config file.
+
+
+def test_defaults_applied_when_no_optimization_block(write_config):
+    """A source declaring nothing still gets the framework's file management.
+
+    Small-file accumulation is the default failure mode of streaming ingestion,
+    so compaction has to be opt-out rather than opt-in.
+    """
+    from pipelines.framework import load_source_configs
+
+    directory = write_config("t.yaml", KAFKA_CONFIG)
+    cfg = load_source_configs(directory)[0]
+
+    assert cfg.table_properties["delta.autoOptimize.optimizeWrite"] == "true"
+    assert cfg.table_properties["delta.autoOptimize.autoCompact"] == "true"
+    assert cfg.table_properties["delta.enableChangeDataFeed"] == "true"
+    assert cfg.cluster_by == []
+
+
+def test_source_can_override_a_default_property(write_config):
+    from pipelines.framework import load_source_configs
+
+    directory = write_config(
+        "t.yaml",
+        KAFKA_CONFIG
+        + "optimization:\n"
+        "  table_properties:\n"
+        "    delta.enableChangeDataFeed: false\n",
+    )
+    cfg = load_source_configs(directory)[0]
+
+    # Overridden, while the untouched defaults survive.
+    assert cfg.table_properties["delta.enableChangeDataFeed"] == "false"
+    assert cfg.table_properties["delta.autoOptimize.autoCompact"] == "true"
+
+
+def test_cluster_by_limited_to_four_columns(write_config):
+    """Delta caps clustering keys at four; catch it at config load."""
+    from pipelines.framework import load_source_configs
+
+    directory = write_config(
+        "t.yaml",
+        KAFKA_CONFIG
+        + "columns:\n"
+        + "".join(f"  - {{name: c{i}}}\n" for i in range(5))
+        + "optimization:\n"
+        "  cluster_by: [c0, c1, c2, c3, c4]\n",
+    )
+
+    with pytest.raises(ValueError, match="at most 4"):
+        load_source_configs(directory)
+
+
+def test_cluster_by_must_reference_declared_columns(write_config):
+    """A typo in a clustering key would otherwise fail at table creation.
+
+    This is not hypothetical: clustering bronze.transactions on customer_id was
+    rejected here because bronze keeps the Kafka payload unparsed, so
+    customer_id does not exist until silver.
+    """
+    from pipelines.framework import load_source_configs
+
+    directory = write_config(
+        "t.yaml",
+        KAFKA_CONFIG
+        + "columns:\n  - {name: value}\n"
+        "optimization:\n  cluster_by: [customer_id]\n",
+    )
+
+    with pytest.raises(ValueError, match="cluster_by references columns"):
+        load_source_configs(directory)
+
+
+def test_optimization_must_be_a_mapping(write_config):
+    from pipelines.framework import load_source_configs
+
+    directory = write_config("t.yaml", KAFKA_CONFIG + "optimization: [a, b]\n")
+
+    with pytest.raises(ValueError, match="must be a mapping"):
+        load_source_configs(directory)

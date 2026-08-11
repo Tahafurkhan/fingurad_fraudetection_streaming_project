@@ -179,6 +179,7 @@ docs/                  architecture, challenges, interview prep
 |---|---|
 | [Setup](docs/setup.md) | Running this on a fresh machine, plus troubleshooting |
 | [Metadata-driven ingestion](docs/metadata_driven_ingestion.md) | Framework design, closure binding, batch vs streaming |
+| [Performance optimization](docs/performance_optimization.md) | Every Spark/Delta optimization applied, in three honest tiers: measured, correct-but-unmeasurable, deliberately rejected |
 | [Engineering challenges](docs/engineering_challenges.md) | 15 real failures — error text, cause, fix, optimization — including one measured negative result |
 | [Interview preparation](docs/interview_preparation.md) | Scenario-driven Q&A: streaming, Kafka, dimensional modeling, dbt, system design, behavioural |
 

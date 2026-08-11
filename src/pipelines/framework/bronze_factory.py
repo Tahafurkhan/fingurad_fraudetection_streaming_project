@@ -49,16 +49,33 @@ def build_bronze_table(cfg: SourceConfig, spark: Any, dbutils: Any) -> None:
     reader = get_reader(cfg.ingestion_type)
     is_batch = cfg.ingestion_type in BATCH_TYPES
 
+    # Physical layout travels with the table definition rather than being
+    # applied afterwards by an ALTER. A property set here is declarative: it is
+    # reapplied on every pipeline update, so it cannot drift the way a one-off
+    # ALTER against a live table can.
+    table_properties = cfg.table_properties
+    cluster_by = cfg.cluster_by
+
     if is_batch:
 
-        @dp.materialized_view(name=cfg.target, comment=cfg.comment)
+        @dp.materialized_view(
+            name=cfg.target,
+            comment=cfg.comment,
+            table_properties=table_properties,
+            cluster_by=cluster_by or None,
+        )
         def _bronze_view() -> DataFrame:
             return _project(reader(spark, dbutils, cfg.ingestion), cfg)
 
         _bronze_view.__name__ = f"bronze_{cfg.name}"
         return
 
-    @dp.table(name=cfg.target, comment=cfg.comment)
+    @dp.table(
+        name=cfg.target,
+        comment=cfg.comment,
+        table_properties=table_properties,
+        cluster_by=cluster_by or None,
+    )
     def _bronze_table() -> DataFrame:
         return _project(reader(spark, dbutils, cfg.ingestion), cfg)
 

@@ -3,9 +3,29 @@ from pyspark.sql import functions as F
 from pyspark.sql.dataframe import DataFrame
 
 
+# The most extreme small-file case in the project: 93 rows across 17 files,
+# roughly 5KB each, because each Auto Loader micro-batch commits its own file
+# regardless of how little it contains.
+#
+# This is the clearest illustration of why compaction is not optional for
+# streaming ingestion. The data is trivial; the file count is not. Every query
+# opens 17 files, reads 17 footers, and plans 17 splits to scan 89KB.
+#
+# No clustering keys: with 93 rows there is nothing to prune, and entity_id --
+# the column the gold join uses -- has near-unique values, which would make
+# clustering churn on every write for no read benefit.
+_TABLE_PROPERTIES = {
+    "delta.autoOptimize.optimizeWrite": "true",
+    "delta.autoOptimize.autoCompact": "true",
+    "delta.enableChangeDataFeed": "true",
+    "delta.tuneFileSizesForRewrites": "true",
+}
+
+
 @dp.table(
-name="finguard.silver.fraud_watchlist"
-,comment="Cleaned fraud watchlist"
+    name="finguard.silver.fraud_watchlist",
+    comment="Cleaned fraud watchlist",
+    table_properties=_TABLE_PROPERTIES,
 )
 def fraud_watchlist_silver() -> DataFrame:
 

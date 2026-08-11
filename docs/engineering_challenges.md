@@ -32,6 +32,28 @@ worth more than the individual anecdotes.
 | 13 | Liquid clustering — a negative result | Optimization |
 | 14 | Git Bash path mangling broke dbt connections | Tooling |
 | 15 | Cross-cluster Kafka migration invalidated checkpoints | Streaming state |
+| 16 | dbt silently ignored every optimization config | Silent failure |
+| 17 | Liquid clustering requires stats on its own keys | Delta internals |
+
+Challenges 16 and 17 arose during the optimization work and are documented in
+full, with measurements, in
+[performance_optimization.md](performance_optimization.md). Summarised here
+because both are strong interview material:
+
+**16.** `cluster_by` and `table_properties` parsed cleanly, appeared in
+`target/manifest.json`, and produced `PASS=63 ERROR=0` — while applying
+nothing. dbt-databricks reads `liquid_clustered_by` and `tblproperties`, and
+dbt accepts unknown config keys without complaint. Only `DESCRIBE DETAIL`
+revealed that the tables had no clustering and no properties. Same class as
+challenges 1 and 11: success reported, nothing done.
+
+**17.** Liquid clustering requires every clustering column to have statistics,
+and Delta collects stats only for the first N columns. This broke the build
+twice — once because `alert_timestamp` sat at column ~52 in a wide table, and
+once self-inflicted, because setting `dataSkippingNumIndexedCols: 12` as an
+optimization excluded `transaction_timestamp` at column 14 from a table that
+clusters on it. Lowering the stats budget silently constrains which columns can
+be clustered.
 
 ---
 

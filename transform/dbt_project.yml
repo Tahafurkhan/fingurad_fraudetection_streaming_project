@@ -25,6 +25,26 @@ models:
       +materialized: view
     marts:
       +materialized: table
+      # File management for every mart, so a new model inherits it rather than
+      # relying on whoever adds it to remember.
+      #
+      # These are the same properties the streaming layer sets on its Delta
+      # tables. Marts are rebuilt or merged rather than streamed, so they
+      # accumulate small files more slowly -- but an incremental model doing a
+      # merge every run still rewrites files each time, and without compaction
+      # those fragments persist.
+      #
+      # The key is `tblproperties`, NOT `table_properties`. dbt accepts any
+      # config key it does not recognise, stores it in the manifest, and never
+      # applies it -- the run succeeds and the table is left unoptimised. That
+      # happened here: `table_properties` parsed cleanly, appeared in
+      # target/manifest.json, and produced a table with no properties set at
+      # all. Verified against DESCRIBE DETAIL rather than trusting the run
+      # result. See docs/performance_optimization.md.
+      +tblproperties:
+        delta.autoOptimize.optimizeWrite: "true"
+        delta.autoOptimize.autoCompact: "true"
+        delta.tuneFileSizesForRewrites: "true"
 
 # dbt's default generate_schema_name appends the model's schema config to the
 # target schema, producing `marts_marts`. The override in macros/ uses the

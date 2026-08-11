@@ -37,6 +37,60 @@ resources:
         # hardcoded in the Python.
         finguard.catalog: ${var.catalog}
 
+        # --- Shuffle sizing --------------------------------------------------
+        # The default of 200 shuffle partitions is sized for a large cluster and
+        # large data. This project processes ~4,400 rows, so 200 partitions
+        # means roughly 22 rows each: 200 tasks scheduled, 200 empty-ish files
+        # considered, and scheduling overhead that dwarfs the actual work.
+        #
+        # This is the most common misconfiguration in small Spark jobs, and it
+        # is also a direct contributor to the small-file problem -- each shuffle
+        # partition can produce its own output file.
+        #
+        # 16 is chosen for this data volume, not copied from a guide. At
+        # production volume this should rise; the general rule is to target
+        # partitions of roughly 128MB rather than to pick a fixed number.
+        spark.sql.shuffle.partitions: "16"
+
+        # --- Adaptive Query Execution ---------------------------------------
+        # AQE is on by default in current runtimes; these are declared
+        # explicitly so the intent is visible in review rather than inherited.
+        #
+        # coalescePartitions lets Spark merge small post-shuffle partitions at
+        # runtime, which is the safety net for the setting above being wrong in
+        # either direction.
+        #
+        # skewJoin splits oversized partitions caused by hot keys. Relevant to
+        # fraud data specifically: a single high-volume merchant or a card under
+        # attack produces exactly the key skew this handles.
+        spark.sql.adaptive.enabled: "true"
+        spark.sql.adaptive.coalescePartitions.enabled: "true"
+        spark.sql.adaptive.skewJoin.enabled: "true"
+
+        # --- Streaming state store -------------------------------------------
+        # RocksDB rather than the default in-memory HDFS-backed state store.
+        #
+        # The default keeps all state on the JVM heap, so state size competes
+        # with execution memory and large state shows up as GC pressure and
+        # eventually OOM. RocksDB spills to local disk and keeps only hot data
+        # in memory, which is what makes stateful streaming survive state that
+        # exceeds RAM.
+        #
+        # This project has three stateful operators -- the stream-stream join in
+        # fraud_card_alert, dropDuplicatesWithinWatermark in merchants_silver,
+        # and the windowed aggregations -- so state is bounded by watermarks but
+        # not trivial.
+        #
+        # Changing the state store provider requires a fresh checkpoint; it
+        # cannot be swapped on a running query.
+        spark.sql.streaming.stateStore.providerClass: >-
+          org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
+
+        # Track how much state each operator holds. Without this, unbounded
+        # state growth is invisible until the job dies; with it, the metric
+        # appears in the streaming query progress and can be alerted on.
+        spark.sql.streaming.metricsEnabled: "true"
+
       notifications:
         - email_recipients:
             - ${var.notifications_email}
@@ -59,6 +113,14 @@ resources:
       libraries:
         - glob:
             include: ../src/pipelines/customers/silver/**
+
+      configuration:
+        # Same reasoning as the main pipeline: 200 shuffle partitions for 1,002
+        # customer rows is scheduling overhead, not parallelism. This pipeline
+        # has no stateful operators, so it needs no state store override.
+        spark.sql.shuffle.partitions: "8"
+        spark.sql.adaptive.enabled: "true"
+        spark.sql.adaptive.coalescePartitions.enabled: "true"
 
       notifications:
         - email_recipients:

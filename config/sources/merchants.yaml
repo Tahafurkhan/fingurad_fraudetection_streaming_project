@@ -18,6 +18,13 @@ ingestion:
   type: autoloader
   path: /Volumes/finguard/source/merchants/source_data/
   format: csv
+  max_files_per_trigger: 100
+  # Pin the types that matter rather than letting inference decide them from a
+  # sample. merchant_id inferred as an integer would break the moment an ID
+  # arrives with a leading zero or a letter, and is_blacklisted inferred from a
+  # file where every value happens to be "false" can come back as a string.
+  # Inference stays on for the descriptive columns where it is harmless.
+  schema_hints: "merchant_id STRING, is_blacklisted BOOLEAN"
   options:
     cloudFiles.inferColumnTypes: "true"
     # The generator writes a header row; without this the header becomes data.
@@ -25,6 +32,16 @@ ingestion:
     # Surface unexpected columns rather than dropping them silently, matching
     # how fraud_watchlist handles drift.
     cloudFiles.schemaEvolutionMode: "rescue"
+
+optimization:
+  # 400 rows in 2 files. No clustering: nothing to prune.
+  #
+  # This is the table that gets BROADCAST in downstream joins rather than
+  # clustered -- at 200 distinct merchants it fits comfortably under the
+  # broadcast threshold, so the join needs no shuffle at all. Broadcasting is
+  # the optimization that applies to a small dimension; clustering is for large
+  # facts. See silver/merchants_silver.py and the gold join.
+  cluster_by: []
 
 columns:
   - {name: merchant_id}

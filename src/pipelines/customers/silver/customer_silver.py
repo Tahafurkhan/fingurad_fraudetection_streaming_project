@@ -3,9 +3,39 @@ from pyspark.sql import functions as F
 from pyspark.sql.dataframe import DataFrame
 
 
+# Clustered on customer_id: this is the CDC-fed table every gold model joins,
+# and customer_id is the only predicate any of them use.
+#
+# It is also the table where clustering will matter first in practice. Bronze
+# CDC appends one row per customer *per change*, so unlike the other silver
+# tables this one grows without bound as customers are updated at source --
+# 1,002 customers today, but one row per edit forever. That growth pattern is
+# exactly what clustering is for.
+#
+# update_timestamp is deliberately NOT a second key. The gold models reduce to
+# the latest row per customer with a window function rather than filtering on a
+# timestamp range, so a clustering key on it would be maintained on every write
+# and read by nothing.
+_TABLE_PROPERTIES = {
+    "delta.autoOptimize.optimizeWrite": "true",
+    "delta.autoOptimize.autoCompact": "true",
+    # CDF matters more here than elsewhere: this table already represents a
+    # change stream, and downstream SCD2 snapshots consume its transitions.
+    "delta.enableChangeDataFeed": "true",
+    "delta.tuneFileSizesForRewrites": "true",
+    # 22 columns, most of them descriptive. Statistics on the leading 12 cover
+    # customer_id and the numeric attributes that get filtered; collecting
+    # min/max over the remaining free-text columns is write cost with no
+    # matching read benefit.
+    "delta.dataSkippingNumIndexedCols": "12",
+}
+
+
 @dp.table(
-name="finguard.silver.customers"
-,comment="Parsed and cleaned customer data"
+    name="finguard.silver.customers",
+    comment="Parsed and cleaned customer data",
+    table_properties=_TABLE_PROPERTIES,
+    cluster_by=["customer_id"],
 )
 @dp.expect_or_drop("valid_customer_id","customer_id IS NOT NULL")
 def customers_silver() -> DataFrame:

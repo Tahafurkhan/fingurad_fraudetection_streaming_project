@@ -11,12 +11,48 @@
 -- the SCD2 dimensions on the validity window fixes that for analysis, without
 -- touching the operational path.
 
+-- `on_schema_change` was previously unset, which means dbt's default `ignore`:
+-- a new column added upstream is silently absent here, and the model keeps
+-- succeeding. Schema drift is exactly the kind of change that should be
+-- visible, so new columns are appended rather than dropped.
+--
+-- Clustered on customer_id (investigation: "everything for this customer") and
+-- alert_timestamp (time-bounded dashboards). Same honest caveat as
+-- fct_transactions: correct keys for the access pattern, inert at 353 rows in
+-- a single file.
+--
+-- WHY dataSkippingNumIndexedCols IS RAISED HERE. Clustering columns must have
+-- statistics, and Delta only collects stats for the first N columns (default
+-- 32). This table is ~60 columns wide and alert_timestamp sits near the end,
+-- so the first attempt failed with:
+--
+--   [DELTA_CLUSTERING_COLUMN_MISSING_STATS] Liquid clustering requires
+--   clustering columns to have stats. Couldn't find clustering column(s)
+--   'alert_timestamp' in stats schema
+--
+-- Two fixes exist. Reordering the select to move clustering keys into the
+-- first 32 columns is free but makes column order load-bearing, which is a
+-- trap for the next person who reorders for readability. Raising the stats
+-- budget is explicit and self-documenting, at the cost of computing min/max
+-- for more columns on every write.
+--
+-- 64 rather than "all": stats on long free-text columns
+-- (reason_description) are write cost with no read benefit, and this covers
+-- every column a predicate actually uses.
 {{
     config(
         materialized='incremental',
         unique_key='alert_id',
         incremental_strategy='merge',
-        file_format='delta'
+        file_format='delta',
+        on_schema_change='append_new_columns',
+        liquid_clustered_by=['customer_id', 'alert_timestamp'],
+        tblproperties={
+            'delta.dataSkippingNumIndexedCols': '64',
+            'delta.autoOptimize.optimizeWrite': 'true',
+            'delta.autoOptimize.autoCompact': 'true',
+            'delta.tuneFileSizesForRewrites': 'true'
+        }
     )
 }}
 

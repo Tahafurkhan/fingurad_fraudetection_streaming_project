@@ -12,13 +12,43 @@
 --    last week is attributed to the customer risk profile and merchant risk
 --    rating that were in force last week.
 
+-- PHYSICAL LAYOUT. Clustered on the columns that appear in predicates:
+-- customer_id for investigation lookups, transaction_date for reporting
+-- ranges. Declared in the model rather than applied by an ALTER so the layout
+-- is rebuilt with the table and shows up in code review -- an ALTER against a
+-- live table is invisible to the repository and drifts silently.
+--
+-- The config key is `liquid_clustered_by`. dbt-databricks does NOT read
+-- `cluster_by` -- and dbt silently accepts unknown config keys, so the wrong
+-- name parses, lands in the manifest, and applies nothing while the run
+-- reports success.
+--
+-- MEASURED HONESTLY: this table is currently a single 129KB file. Clustering
+-- prunes files, and there is exactly one, so it prunes nothing. An earlier
+-- benchmark appeared to show an 8-13% gain; that was warehouse warm-up, not
+-- clustering, and the number is not claimed anywhere. The keys are correct for
+-- the access pattern at scale and inert at this volume. See
+-- docs/performance_optimization.md for the measurements.
+--
+-- MERGE COST. `incremental_predicates` bounds the target side of the merge.
+-- Without it, MERGE scans the whole target table to find matches for the
+-- incoming rows -- the merge gets more expensive every run as history
+-- accumulates, even though the batch stays the same size. Restricting it to
+-- the same window the source filter uses means the merge only touches recent
+-- files, which is the difference between a merge that scales and one that
+-- degrades.
 {{
     config(
         materialized='incremental',
         unique_key='transaction_id',
         incremental_strategy='merge',
         file_format='delta',
-        on_schema_change='append_new_columns'
+        on_schema_change='append_new_columns',
+        liquid_clustered_by=['customer_id', 'transaction_date'],
+        incremental_predicates=[
+            "DBT_INTERNAL_DEST.transaction_timestamp >= "
+            "current_timestamp() - interval 4 days"
+        ]
     )
 }}
 

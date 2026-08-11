@@ -26,11 +26,19 @@ def stub_pyspark(monkeypatch):
     Autouse because every test in this suite imports the framework, and a
     partially-imported module would leak between tests.
     """
-    registered: dict[str, list[str]] = {"table": [], "materialized_view": []}
+    # Names for the existing assertions, plus the full kwargs so tests can
+    # verify that physical-layout settings (table_properties, cluster_by)
+    # actually reach the decorator rather than being computed and dropped.
+    registered: dict[str, list] = {
+        "table": [],
+        "materialized_view": [],
+        "kwargs": [],
+    }
 
     def _table(**kwargs):
         def decorator(fn):
             registered["table"].append(kwargs.get("name"))
+            registered["kwargs"].append(kwargs)
             return fn
 
         return decorator
@@ -38,6 +46,7 @@ def stub_pyspark(monkeypatch):
     def _materialized_view(**kwargs):
         def decorator(fn):
             registered["materialized_view"].append(kwargs.get("name"))
+            registered["kwargs"].append(kwargs)
             return fn
 
         return decorator

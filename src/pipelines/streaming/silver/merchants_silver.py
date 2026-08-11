@@ -16,9 +16,32 @@ from pyspark.sql.dataframe import DataFrame
 # change history from bronze.
 
 
+# NO CLUSTERING KEYS, deliberately.
+#
+# 200 rows in a single 6KB file. Clustering works by letting a query skip
+# files; with one file there is nothing to skip, so declaring keys would add
+# metadata and clustering maintenance cost for exactly zero benefit.
+#
+# The optimization that DOES apply to a table this size is the opposite one:
+# it is small enough to broadcast, so joins against it need no shuffle at all.
+# See the broadcast hint in gold/fraud_card_alert.py. Small dimensions get
+# broadcast; large facts get clustered. Applying the fact-table optimization to
+# a 200-row dimension is a common and expensive mistake.
+#
+# Compaction still matters even here -- each Auto Loader batch would otherwise
+# leave its own file behind.
+_TABLE_PROPERTIES = {
+    "delta.autoOptimize.optimizeWrite": "true",
+    "delta.autoOptimize.autoCompact": "true",
+    "delta.enableChangeDataFeed": "true",
+    "delta.tuneFileSizesForRewrites": "true",
+}
+
+
 @dp.table(
     name="finguard.silver.merchants",
     comment="Cleaned merchant master; one current row per merchant_id",
+    table_properties=_TABLE_PROPERTIES,
 )
 # Identity must exist -- a merchant row without an id cannot be joined to a
 # transaction, so it is useless rather than merely imperfect.

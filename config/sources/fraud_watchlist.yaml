@@ -13,8 +13,26 @@ ingestion:
   type: autoloader
   path: /Volumes/finguard/source/fraud_watchlist/source_data/
   format: json
+  # Bound the per-batch file count so a backlog in the source path is processed
+  # over several batches instead of one. Measured effect at current volume:
+  # none -- files arrive a few at a time. It matters after any outage where
+  # files accumulate while the stream is down.
+  max_files_per_trigger: 100
   options:
     cloudFiles.inferColumnTypes: "true"
+
+optimization:
+  # No clustering keys, deliberately.
+  #
+  # 93 rows across 19 files. Clustering works by letting a query skip files;
+  # with this little data there is nothing worth skipping, and declaring keys
+  # would add metadata for no benefit. Knowing when NOT to apply an
+  # optimization is the point -- see docs/performance_optimization.md.
+  #
+  # What this table DOES need is compaction: 19 files for 93 rows is ~5KB per
+  # file against a target measured in megabytes. optimizeWrite and autoCompact
+  # come from the framework defaults and address exactly that.
+  cluster_by: []
 
 columns:
   - {name: watchlist_id}

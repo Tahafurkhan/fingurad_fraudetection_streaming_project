@@ -167,3 +167,70 @@ def test_unknown_ingestion_type_names_known_types(write_config, stub_readers):
     message = str(excinfo.value)
     assert "kinesis" in message
     assert "known types" in message
+
+
+# --- Physical layout reaches the runtime -----------------------------------
+
+
+def _layout_config(**optimization):
+    """A minimal kafka SourceConfig carrying an optimization block."""
+    from pipelines.framework.source_config import Column, SourceConfig
+
+    return SourceConfig(
+        name="layout",
+        target="cat.schema.layout",
+        comment="",
+        ingestion={"type": "kafka", "secret_scope": "s", "secret_key": "k"},
+        columns=[Column(name="value"), Column(name="ts")],
+        optimization=optimization,
+    )
+
+
+def test_layout_settings_reach_the_decorator(stub_readers, stub_pyspark):
+    """Physical layout must be passed to @dp.table, not merely computed.
+
+    A property resolved correctly and then dropped before registration is
+    indistinguishable from having no property at all -- until someone checks
+    DESCRIBE DETAIL in production and finds the table unoptimised.
+    """
+    from pipelines.framework.bronze_factory import build_bronze_table
+
+    cfg = _layout_config(
+        cluster_by=["ts"],
+        table_properties={"delta.dataSkippingNumIndexedCols": 4},
+    )
+    build_bronze_table(cfg, spark=object(), dbutils=object())
+
+    kwargs = stub_pyspark["kwargs"][-1]
+    assert kwargs["cluster_by"] == ["ts"]
+    assert kwargs["table_properties"]["delta.dataSkippingNumIndexedCols"] == "4"
+    # The override rides alongside the framework defaults.
+    assert kwargs["table_properties"]["delta.autoOptimize.autoCompact"] == "true"
+
+
+def test_no_clustering_keys_passes_none_not_empty_list(stub_readers, stub_pyspark):
+    """An empty cluster_by must not be forwarded as an empty list.
+
+    `cluster_by=[]` reads as "cluster by nothing", which is not the same as
+    declining to cluster. Passing None leaves the table unclustered.
+    """
+    from pipelines.framework.bronze_factory import build_bronze_table
+
+    build_bronze_table(_layout_config(), spark=object(), dbutils=object())
+
+    assert stub_pyspark["kwargs"][-1]["cluster_by"] is None
+
+
+def test_boolean_property_is_lowercased_for_delta(stub_readers, stub_pyspark):
+    """YAML booleans must reach Delta as "false", not Python's "False".
+
+    str(False) is "False", which Delta does not parse as a boolean -- the
+    property is stored but the setting silently does not take effect.
+    """
+    from pipelines.framework.bronze_factory import build_bronze_table
+
+    cfg = _layout_config(table_properties={"delta.enableChangeDataFeed": False})
+    build_bronze_table(cfg, spark=object(), dbutils=object())
+
+    props = stub_pyspark["kwargs"][-1]["table_properties"]
+    assert props["delta.enableChangeDataFeed"] == "false"

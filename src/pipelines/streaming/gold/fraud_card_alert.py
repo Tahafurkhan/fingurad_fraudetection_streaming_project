@@ -4,9 +4,29 @@ from pyspark.sql import functions as F
 from pyspark.sql.dataframe import DataFrame
 
 
+# Alerts are read by investigation queries ("show me everything for this
+# customer") and by the dbt marts, which join on transaction_id. Clustering on
+# customer_id serves the first; alert_timestamp serves time-bounded dashboards.
+#
+# This table is append-only and grows with alert volume rather than transaction
+# volume, so it stays small relative to silver -- but it is the one an analyst
+# queries interactively, which is where file skipping is felt.
+_TABLE_PROPERTIES = {
+    "delta.autoOptimize.optimizeWrite": "true",
+    "delta.autoOptimize.autoCompact": "true",
+    "delta.enableChangeDataFeed": "true",
+    "delta.tuneFileSizesForRewrites": "true",
+}
+
+
 @dp.table(
-name="finguard.gold.fraud_card_alert"
-,comment="Fraud watchlist matches, enriched with the customer record current at ingest time"
+    name="finguard.gold.fraud_card_alert",
+    comment=(
+        "Fraud watchlist matches, enriched with the customer record current "
+        "at ingest time"
+    ),
+    table_properties=_TABLE_PROPERTIES,
+    cluster_by=["customer_id", "alert_timestamp"],
 )
 def fraud_card_alert() -> DataFrame:
     transactions=spark.readStream.table("finguard.silver.transactions")
@@ -40,6 +60,19 @@ def fraud_card_alert() -> DataFrame:
     # responding to a live alert needs.
     latest_customer = (
         spark.read.table("finguard.silver.customers")
+        # Read only what the join and projection need. silver.customers has 22
+        # columns; this query uses six. Delta is columnar, so naming them here
+        # means the other 16 are never read off storage -- and the window
+        # function below shuffles by customer_id, so every unread column is
+        # also a column not moved across the network during that shuffle.
+        .select(
+            "customer_id",
+            "first_name",
+            "last_name",
+            "email",
+            "transaction_limit",
+            "silver_ingestion_timestamp",
+        )
         .withColumn(
             "_row_num",
             F.row_number().over(
@@ -51,7 +84,29 @@ def fraud_card_alert() -> DataFrame:
         .filter(F.col("_row_num") == 1)
         .drop("_row_num")
     )
-    customers = latest_customer
+
+    # Broadcast the customer dimension.
+    #
+    # Without this, Spark shuffles BOTH sides of the join by customer_id on
+    # every micro-batch -- the transaction stream and the whole customer table.
+    # Broadcasting sends the small side to every executor once per batch and
+    # turns the join into a local hash lookup: no shuffle, no exchange, no
+    # sort. For a stream-static join in a micro-batch pipeline this is the
+    # single most valuable hint available, because the shuffle would otherwise
+    # be paid again on every trigger rather than once.
+    #
+    # Safe here because the side being broadcast is bounded and small: 1,002
+    # customers reduced to one row each, six columns, well under the 10MB
+    # default autoBroadcastJoinThreshold.
+    #
+    # WHEN THIS BECOMES WRONG: broadcasting is a driver-memory bet. The dataset
+    # is collected to the driver and shipped to every executor, so a dimension
+    # that grows past the threshold turns this hint into an OOM rather than a
+    # speedup. At a few million customers this must be removed and the join
+    # left to shuffle -- or the dimension pre-filtered to the customers that
+    # actually appear in the batch. A broadcast hint is a statement about size
+    # that stops being true silently.
+    customers = F.broadcast(latest_customer)
 
     transactions_with_watermark=transactions.withWatermark("transaction_timestamp", "5 minutes")
     fraud_watchlist_with_watermark=fraud_watchlist.withWatermark("effective_from", "5 minutes")

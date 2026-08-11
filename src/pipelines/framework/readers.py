@@ -30,7 +30,7 @@ def read_kafka(spark: Any, dbutils: Any, cfg: dict[str, Any]) -> DataFrame:
         f'required username="{conn["api_key"]}" password="{conn["api_secret"]}";'
     )
 
-    return (
+    reader = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", conn["bootstrap_servers"])
         .option("subscribe", conn["topic"])
@@ -38,8 +38,33 @@ def read_kafka(spark: Any, dbutils: Any, cfg: dict[str, Any]) -> DataFrame:
         .option("kafka.sasl.mechanism", cfg.get("sasl_mechanism", "PLAIN"))
         .option("kafka.sasl.jaas.config", jaas)
         .option("startingOffsets", cfg.get("starting_offsets", "earliest"))
-        .load()
     )
+
+    # Bound how much a single micro-batch may read.
+    #
+    # This matters most on the first run and after any checkpoint reset. With
+    # `startingOffsets: earliest` and no limit, Spark plans ONE batch covering
+    # the entire retention window -- potentially millions of records -- and
+    # tries to hold that batch's state on the driver. The symptom is a job that
+    # appears hung for a long time and then dies on memory, which reads like a
+    # cluster sizing problem and is actually an unbounded first batch.
+    #
+    # Capping it turns one enormous batch into many predictable ones. Steady
+    # state is unaffected: if the arrival rate is below the cap the limit never
+    # binds, so this costs nothing when the stream is keeping up. It is
+    # insurance against replay, not a throughput throttle.
+    max_offsets = cfg.get("max_offsets_per_trigger")
+    if max_offsets:
+        reader = reader.option("maxOffsetsPerTrigger", int(max_offsets))
+
+    # Fail the stream if the requested offsets no longer exist rather than
+    # silently skipping ahead. `failOnDataLoss: false` is the tempting fix when
+    # a topic is recreated or ages out -- and it permanently disables the alarm
+    # for genuine loss. Keep it strict; handle real migrations by resetting the
+    # checkpoint deliberately.
+    reader = reader.option("failOnDataLoss", str(cfg.get("fail_on_data_loss", True)).lower())
+
+    return reader.load()
 
 
 def read_autoloader(spark: Any, dbutils: Any, cfg: dict[str, Any]) -> DataFrame:
@@ -48,6 +73,40 @@ def read_autoloader(spark: Any, dbutils: Any, cfg: dict[str, Any]) -> DataFrame:
         spark.readStream.format("cloudFiles")
         .option("cloudFiles.format", cfg["format"])
     )
+
+    # Bound the per-batch file count for the same reason as maxOffsetsPerTrigger
+    # on Kafka: a backlog of files in the source path would otherwise be read as
+    # one batch. Auto Loader also accepts cloudFiles.maxBytesPerTrigger, which
+    # is the better control when file sizes vary widely -- 1000 small files and
+    # 1000 large ones are very different batches.
+    max_files = cfg.get("max_files_per_trigger")
+    if max_files:
+        reader = reader.option("cloudFiles.maxFilesPerTrigger", int(max_files))
+
+    max_bytes = cfg.get("max_bytes_per_trigger")
+    if max_bytes:
+        reader = reader.option("cloudFiles.maxBytesPerTrigger", str(max_bytes))
+
+    # File notification mode uses cloud pub/sub to learn about new files instead
+    # of listing the directory. Directory listing is O(files in path) on every
+    # trigger, so it degrades as the path fills up; notification stays constant.
+    # Off by default because it needs cloud resources provisioned, and directory
+    # listing is fine at low file counts.
+    if cfg.get("use_notifications"):
+        reader = reader.option("cloudFiles.useNotifications", "true")
+
+    # Schema inference reads a sample of the data on every stream start.
+    # Providing a schema location makes Auto Loader persist the inferred schema
+    # so restarts skip that work, and it is what enables schema evolution to be
+    # detected rather than guessed at fresh each time.
+    if cfg.get("schema_location"):
+        reader = reader.option("cloudFiles.schemaLocation", cfg["schema_location"])
+
+    # Explicit hints stop Auto Loader from inferring a type that is right for
+    # the sample and wrong for the data -- an ID column of digits inferred as
+    # bigint, then a later file arrives with a leading zero or a letter.
+    if cfg.get("schema_hints"):
+        reader = reader.option("cloudFiles.schemaHints", cfg["schema_hints"])
 
     for key, value in cfg.get("options", {}).items():
         reader = reader.option(key, value)

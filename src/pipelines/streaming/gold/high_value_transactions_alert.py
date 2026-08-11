@@ -6,9 +6,22 @@ from pyspark.sql.functions import *
 from pyspark.sql.types import *
 
 
+_TABLE_PROPERTIES = {
+    "delta.autoOptimize.optimizeWrite": "true",
+    "delta.autoOptimize.autoCompact": "true",
+    "delta.enableChangeDataFeed": "true",
+    "delta.tuneFileSizesForRewrites": "true",
+}
+
+
 @dp.table(
     name="finguard.gold.high_value_transactions_alert",
-    comment="Alert details where transaction has been performed with value higher than what is configured by customer"
+    comment=(
+        "Alert details where transaction has been performed with value higher "
+        "than what is configured by customer"
+    ),
+    table_properties=_TABLE_PROPERTIES,
+    cluster_by=["customer_id", "alert_timestamp"],
 )
 def high_value_transactions_alert() -> DataFrame:
     transactions=spark.readStream.table("finguard.silver.transactions")
@@ -24,8 +37,21 @@ def high_value_transactions_alert() -> DataFrame:
     # See gold/fraud_card_alert.py for the fuller note on why current-state
     # enrichment (rather than point-in-time) is the right choice for the
     # operational alerting path.
-    customers=(
+    # Broadcast, and project before the window function -- see the fuller note
+    # in gold/fraud_card_alert.py. Both apply identically here: naming the
+    # columns keeps the unused 16 out of the customer_id shuffle, and the
+    # broadcast removes the shuffle on the join itself so it is not paid again
+    # on every micro-batch.
+    customers = F.broadcast(
         spark.read.table("finguard.silver.customers")
+        .select(
+            "customer_id",
+            "first_name",
+            "last_name",
+            "email",
+            "transaction_limit",
+            "silver_ingestion_timestamp",
+        )
         .withColumn(
             "_row_num",
             F.row_number().over(

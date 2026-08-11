@@ -16,6 +16,49 @@ ingestion:
   starting_offsets: earliest
   security_protocol: SASL_SSL
   sasl_mechanism: PLAIN
+  # Cap records per micro-batch. This binds only on replay: at ~5 records/sec
+  # the steady-state batch is far below this, so the limit costs nothing during
+  # normal operation. It exists for the first run after a checkpoint reset,
+  # where `earliest` would otherwise plan a single batch over the entire
+  # retention window and exhaust driver memory.
+  max_offsets_per_trigger: 50000
+  # Fail loudly if committed offsets no longer exist. Setting this false is the
+  # standard workaround for a recreated topic and permanently disables the only
+  # alarm for genuine data loss -- see docs/engineering_challenges.md #15.
+  fail_on_data_loss: true
+
+optimization:
+  # Liquid clustering rather than partitioning.
+  #
+  # Partitioning by date at this volume would produce roughly one small file
+  # per day -- the over-partitioning failure mode, where directory count grows
+  # without any file being large enough to be worth pruning. Clustering keys
+  # can also be redefined later without rewriting history, which partitioning
+  # cannot do.
+  #
+  # KEY CHOICE IS CONSTRAINED BY THE LAYER. The obvious keys would be
+  # customer_id and transaction_timestamp -- but neither exists here. Bronze
+  # deliberately keeps the Kafka payload as an unparsed `value` string, so the
+  # only columns available are the envelope: topic, partition, offset,
+  # timestamp. Clustering on a business key is impossible until silver parses
+  # the JSON, and that is a direct consequence of the raw-payload design, not
+  # an oversight.
+  #
+  # So the keys are the ones bronze is actually queried by: `timestamp` for
+  # time-bounded replay, `partition` for offset-range investigation of a
+  # specific Kafka partition. Business-key clustering happens in silver, where
+  # customer_id exists as a real column.
+  #
+  # HONEST NOTE: at 4,432 rows across ~29 files there is almost nothing to
+  # prune. Declared because it is the correct layout for the access pattern at
+  # scale, not because a gain has been measured here. See
+  # docs/performance_optimization.md for the numbers.
+  cluster_by: [timestamp, partition]
+  table_properties:
+    # Skipping statistics are collected on the first N columns. The default is
+    # 32; this table has 8, so all are indexed and the setting is explicit
+    # rather than incidental.
+    delta.dataSkippingNumIndexedCols: "8"
 
 # Kafka payloads stay unparsed in bronze -- value is kept as a raw string and
 # the envelope fields are preserved so silver can replay or debug any offset.
