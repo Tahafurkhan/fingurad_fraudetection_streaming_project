@@ -55,6 +55,7 @@ because a report containing only successes is a marketing document.
 | 15 | Liquid clustering requires stats on its own keys | Delta internals | Medium |
 | 16 | Kafka authentication failure blocks the whole DAG | Blast radius | Medium |
 | 17 | Cross-cluster Kafka migration invalidated checkpoints | Streaming state | Medium |
+| 18 | Cost detection rejected at the wrong scope — $239 idle endpoint | Cost / FinOps | High |
 
 **The four themes.** These seventeen incidents collapse into four failure
 modes, and the themes are worth more in an interview than any single anecdote:
@@ -68,6 +69,8 @@ modes, and the themes are worth more in an interview than any single anecdote:
    what is declared.
 4. **Blast radius** (7, 16) — one failing component takes down more than it
    should.
+5. **Wrong unit of analysis** (18) — the measurement was correct and pointed at
+   the wrong thing, so it could not see the problem.
 
 ---
 
@@ -1039,6 +1042,171 @@ failure into permanent silence.
 
 ---
 
+# 18. CHALLENGE: Cost detection rejected at the wrong scope
+
+## 18.1 Description
+
+When the observability layer was designed, cost anomaly detection was
+deliberately **rejected**, with this reasoning recorded at the time:
+
+> `system.billing.usage` is real, but with usage this small the variance is
+> noise.
+
+Six weeks later, a cost audit measured the workspace:
+
+| | 30-day spend |
+|---|---|
+| Workspace total | **$395.83** |
+| Attributable to FinGuard | $59.63 |
+| `PREMIUM_SERVERLESS_REAL_TIME_INFERENCE` | **$239.35** |
+
+A serverless model-serving endpoint, unrelated to this project and long
+forgotten, had been burning a flat **96 DBU/day floor** for weeks — billing
+whether or not anything called it. It cost **four times the entire fraud
+platform**.
+
+## 18.2 Impact
+
+**Severity: High**, and entirely invisible to every control that existed.
+
+- **Cost impact:** $239.35 over 30 days, ongoing at time of discovery.
+- **Correctness impact:** none.
+- **Detection impact:** total. The cost panel on the dashboard was scoped to
+  `usage_metadata.dlt_pipeline_id IS NOT NULL` — pipeline spend only — so the
+  single largest line item in the workspace was excluded by construction.
+
+## 18.3 Root Cause Analysis
+
+The original reasoning was **half right, and rejected at the wrong scope.**
+
+It is correct for the pipeline. FinGuard costs about $0.29/day, and a detector
+on that number fires on rounding. Building spend anomaly detection for it would
+have produced pure noise — the concern was legitimate.
+
+It is wrong for the workspace, which is where money is actually lost.
+
+The deeper cause is the **unit of analysis**. Cost monitoring was scoped to the
+thing being built. The thing being built was never the expensive thing. Every
+query, panel and mental model filtered to "my pipeline", and the endpoint sat
+outside that filter in a bucket nobody looked at.
+
+There is a second, subtler cause: **the tell was not size, it was shape.** A
+detector looking for expensive resources would have flagged the endpoint but
+also flagged every legitimate heavy job. What distinguishes waste is a *nonzero
+floor every single day* — real workloads are spiky and touch zero, an idle
+resource never does. `min(daily_dbu)` is the discriminating statistic, and
+nothing was computing it.
+
+## 18.4 Metrics (before)
+
+| Metric | Value |
+|---|---|
+| Cost detectors | 0 |
+| Cost alerts | 0 |
+| Budget tracking | none |
+| Attribution tags | none |
+| Cost visibility scope | pipeline only |
+| Undetected waste | $239.35 / 30 days |
+
+## 18.5 Solution
+
+Five detectors in `sql/ops/cost_checks.sql`, **workspace-scoped by default**,
+plus attribution tags on every declared resource.
+
+The idle-compute detector is the one that matters:
+
+```sql
+SELECT round(sum(daily_dbu), 1) AS dbu_last_7_days, sku_name,
+       round(min(daily_dbu), 1) AS daily_floor_dbu, ...
+FROM (SELECT sku_name, usage_date, sum(usage_quantity) AS daily_dbu
+      FROM system.billing.usage
+      WHERE usage_date > current_date() - 8
+        AND usage_metadata.dlt_pipeline_id IS NULL
+        AND usage_metadata.job_id IS NULL
+      GROUP BY sku_name, usage_date)
+GROUP BY sku_name
+HAVING min(daily_dbu) > 5 AND count(*) >= 6
+```
+
+Two inversions of the obvious approach:
+
+- **`min`, not `sum` or `max`.** Looking for a *floor* rather than a *total*
+  separates idle waste from legitimate heavy usage.
+- **Excluding attributed usage, not including it.** Filtering out rows carrying
+  a pipeline or job id leaves precisely what nobody is watching — the inverse of
+  how the original cost panel was written.
+
+The spend-spike detector requires **both** a 3x multiple **and** a $5 absolute
+floor. The floor is what makes it alertable: at $0.30/day a 3x rise is $0.90, and
+a percentage test alone reproduces exactly the noise that justified the original
+rejection.
+
+## 18.6 Results
+
+| | Before | After |
+|---|---|---|
+| Cost detectors | 0 | 5 (3 alertable, 2 diagnostic) |
+| Cost alerts | 0 | 3 |
+| Dashboard panels | 6 | 8 |
+| Attribution | pipeline id only | project / environment / owner tags |
+| Job timeout | none | 7200s |
+
+Verified against live data:
+
+- Spend-spike detector **would have fired on 2026-08-07** at 5.44x — $41.36
+  against a $7.61 baseline.
+- Idle-compute detector **returns the endpoint**: 1,358 DBU over 7 days, 16.0
+  DBU floor, 8 consecutive days.
+- Budget projection **currently firing**: $484.71 projected against a $300
+  budget, 159.7%.
+- All 7 alerts verified: no duplicates, every bound column numeric, schedules
+  UNPAUSED.
+
+## 18.7 Residual Risk
+
+**These detect; they do not prevent.** Nothing blocks a runaway job mid-flight.
+Real prevention needs account-level budget policies with enforcement, and those
+are not reachable from a workspace API token — both `/api/2.0/budgets` and
+`/api/2.1/budget-policies` return 404. The budget is therefore a constant in a
+SQL query. That has one genuine advantage — the threshold lives in git and
+changes through review rather than being typed into a console — and one real
+limitation, which is that it cannot stop anything.
+
+**The endpoint is still running.** 16 DBU today. It sits outside this project,
+so it is flagged rather than deleted.
+
+## 18.8 Interview Angle
+
+**Question this answers:** "How do you manage cost on a data platform?" and the
+harder follow-up, "how do you find waste?"
+
+**What the interviewer is scoring:** whether you separate *visibility* from
+*control*, and whether you know what waste actually looks like in billing data.
+
+**The strongest thing to say** is not the fix, it is the mistake:
+
+> I rejected cost anomaly detection early on, reasoning that variance at my
+> spend level was noise. I was right about my pipeline — $0.29/day — and wrong
+> about the workspace, where a forgotten serving endpoint was burning four times
+> what my whole platform cost. Monitoring scoped to what you built cannot see
+> what you forgot about, and what you forgot about is where the money goes.
+
+Then the technical discriminator:
+
+> The signal isn't size, it's shape. A big number could be a legitimate heavy
+> job. What identifies waste is a nonzero floor every single day — real
+> workloads are spiky and touch zero, an idle resource never does. So the
+> statistic is `min(daily_dbu)`, not `sum`.
+
+**Expected follow-up — "why is your cost alert daily when your pipeline alerts
+are hourly?"** This tests whether you understand your own data source. Billing
+lands hours late, so an hourly check re-reads the same incomplete day and pages
+repeatedly about one event. Cadence matches how fast the signal can change, not
+how urgent the topic feels.
+
+---
+
+
 # RESULTS & ACHIEVEMENTS
 
 ## Performance improvements (measured)
@@ -1074,6 +1242,17 @@ column statistics and footer. Merging them lets the dictionary encode across all
 | PAN visible to non-privileged caller | 16 digits | last 4 |
 | Tagged-sensitive-but-unmasked | n/a | 0 |
 | Secret scanning in CI | none | gitleaks, full history |
+
+## Cost
+
+| Metric | Value |
+|---|---|
+| 30-day workspace spend | $395.83 |
+| Attributable to FinGuard | $59.63 |
+| Waste found (idle endpoint) | $239.35 |
+| Cost detectors | 5 |
+| Cost alerts | 3 |
+| Monthly budget | $300 (projecting $484.71) |
 
 ## Observability
 

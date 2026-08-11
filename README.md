@@ -63,8 +63,14 @@ the one that contradicts a claim made elsewhere in these docs.
     │  pipeline_runs      ─┐   │   │  3-group access model    │
     │  expectation_results ├─  │   │                          │
     │  stream_health      ─┘   │   │  verified by 6 assertions│
-    │   → 4 SQL Alerts         │   │                          │
-    │   → 6-panel dashboard    │   │                          │
+    │                          │   └──────────────────────────┘
+    │  + cost detectors:       │   ┌──────────────────────────┐
+    │    spend spike           │   │         COST             │
+    │    idle compute          │   │  tags: project/env/owner │
+    │    budget projection     │   │  system.billing.usage    │
+    │                          │   │  list_prices (current)   │
+    │   → 7 SQL Alerts         │   │                          │
+    │   → 8-panel dashboard    │   │  detect, not prevent     │
     └──────────────────────────┘   └──────────────────────────┘
 ```
 
@@ -243,11 +249,16 @@ The platform monitors itself from the pipeline event log:
 | `ops.expectation_results` | 501 rows — per-expectation pass/fail |
 | `ops.stream_health` | 585 rows — watermarks, state size, batch latency |
 
-Four scheduled SQL Alerts (2 hourly PAGE, 2 daily TICKET) and a six-panel
-dashboard. Severity drives cadence: a PAGE check that runs daily is not a page;
-a TICKET check that runs every ten minutes is a mailing list.
+Seven scheduled SQL Alerts and an eight-panel dashboard. Severity drives
+cadence: a PAGE check that runs daily is not a page; a TICKET check that runs
+every ten minutes is a mailing list. Cost checks run daily rather than hourly
+because billing data lands hours late — cadence should match how fast the
+signal can change, not how urgent the topic feels.
 
-**Two real defects found on the first run** — see Known gaps below.
+**Three real findings on first run:** a 606-hour stale watermark, a Spark
+setting inert on stateful operators, and a serverless endpoint burning a flat
+96 DBU/day — $239 over 30 days, four times what this entire platform costs.
+See [cost management](docs/cost_management.md).
 
 ---
 
@@ -281,6 +292,7 @@ docs/                  architecture, challenges, governance, interview prep
 | [Setup](docs/setup.md) | Running this on a fresh machine, plus troubleshooting |
 | [Engineering challenges](docs/engineering_challenges.md) | 17 real failures — error text, root cause, fix, interview angle — including one measured negative result |
 | [Data governance](docs/data_governance.md) | PII masking, classification, access model, and the two leaks the verification found |
+| [Cost management](docs/cost_management.md) | Attribution tags, spend detectors, budget tracking — and the $239 idle endpoint they found |
 | [Observability & monitoring](docs/observability.md) | Event-log telemetry, detectors, alerting and runbook |
 | [Performance optimization](docs/performance_optimization.md) | 19 optimizations in three honest tiers: measured, correct-but-unmeasurable, deliberately rejected |
 | [Metadata-driven ingestion](docs/metadata_driven_ingestion.md) | Framework design, closure binding, batch vs streaming |
@@ -350,6 +362,18 @@ Stated deliberately — an accurate list is more useful than an impressive one.
   800. This contradicts a claim in
   [performance_optimization.md](docs/performance_optimization.md) — recorded
   here rather than quietly corrected there.
+
+**Cost:**
+
+- **A serverless serving endpoint burns ~96 DBU/day doing nothing** — $239.35
+  over 30 days against $59.63 for this entire platform. Scale-to-zero left
+  disabled. Outside this project, so flagged rather than deleted; the idle-compute
+  detector reports it until it is fixed.
+- **Cost controls detect, they do not prevent.** Nothing blocks a runaway job
+  mid-flight. Real prevention needs account-level budget policies, which a
+  workspace token cannot reach (`/api/2.0/budgets` returns 404).
+- **Attribution tags apply to future usage only.** `custom_tags` is stamped at
+  usage time, so the `project=finguard` panel stays empty until the next deploy.
 
 **Security:**
 

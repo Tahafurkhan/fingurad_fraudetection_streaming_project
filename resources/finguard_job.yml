@@ -24,6 +24,23 @@ resources:
       # another run is mid-write on.
       max_concurrent_runs: 1
 
+      # Bound the blast radius of a hung run.
+      #
+      # Without a timeout, a task that hangs rather than fails holds serverless
+      # compute open until someone notices -- and "someone notices" is not a
+      # cost control. The whole DAG completes in single-digit minutes at this
+      # volume, so 2 hours is generous enough to absorb a slow cold start while
+      # still capping what a stuck run can spend.
+      timeout_seconds: 7200
+
+      # Cost attribution, matching the pipelines. See finguard_pipeline.yml for
+      # why these exist rather than relying on usage_metadata alone.
+      tags:
+        project: finguard
+        environment: ${bundle.target}
+        cost_center: data-engineering
+        owner: tahafurkhan@gmail.com
+
       email_notifications:
         on_failure:
           - ${var.notifications_email}

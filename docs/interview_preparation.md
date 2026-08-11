@@ -1051,6 +1051,102 @@ faked.
 
 ---
 
+## Part 9d — Cost management
+
+Increasingly asked at senior level, and most portfolio projects have no answer.
+
+### "How do you control cost on a data platform?"
+
+> Four layers, and I'd separate visibility from control up front because most
+> answers conflate them.
+>
+> **Attribution** — tags on every declared resource (`project`, `environment`,
+> `cost_center`, `owner`) so spend groups by project rather than by resource id.
+> That matters here because my dev and prod bundle targets currently publish to
+> the same catalog, so nothing else distinguishes them in billing.
+>
+> **Detection** — three detectors: daily spend against a trailing median, idle
+> compute, and a monthly budget projection.
+>
+> **Compute controls** — triggered rather than continuous pipelines, warehouse
+> auto-stop at 10 minutes, `maxOffsetsPerTrigger` to bound replay, and a job
+> timeout so a hung task can't hold serverless compute open indefinitely.
+>
+> **And the honest part** — all of that detects, none of it prevents. Nothing
+> blocks a runaway job mid-flight. Real prevention needs account-level budget
+> policies that can enforce, and those aren't reachable from a workspace token —
+> `/api/2.0/budgets` returns 404. So my budget is a constant in a SQL query.
+> That has one advantage, the threshold lives in git and changes through review,
+> and one real limitation, which is that it can't stop anything.
+
+### "How do you find waste?"
+
+The strongest answer available, because it's a real finding and it starts with
+being wrong.
+
+> I'd originally rejected cost anomaly detection when I built my monitoring —
+> the reasoning was that at my spend level the variance is noise. Then I
+> actually measured the workspace: $395 over 30 days, of which my entire fraud
+> platform was $59. A serverless model-serving endpoint I'd forgotten about was
+> burning $239 — four times the whole project.
+>
+> It was a flat 96 DBU/day, every single day. That's scale-to-zero left
+> disabled: it bills for existing, not for working.
+>
+> My reasoning had been right about the pipeline and wrong about the workspace.
+> Monitoring scoped to the thing you're building cannot see the thing you forgot
+> about, and the thing you forgot about is where the money goes. All my
+> detectors are workspace-scoped now.
+
+Then the technical discriminator, which is what separates this from a story:
+
+> The signal isn't size, it's **shape**. A big number might be a legitimate
+> heavy job. What identifies waste is a nonzero floor every single day — real
+> workloads are spiky and touch zero, an idle resource never does. So the
+> statistic is `min(daily_dbu)`, not `sum` or `max`. And I filter *out* rows
+> carrying a pipeline or job id, which leaves exactly what nobody is watching —
+> the inverse of how my original cost panel was written.
+
+### "How do you avoid a cost alert that cries wolf?"
+
+> Require both a multiple and an absolute floor. My spend-spike detector needs
+> 3x the trailing median **and** more than $5. The floor is what makes it
+> alertable — at $0.30/day a 3x rise is 90 cents, and a percentage test alone
+> reproduces exactly the noise that made me reject the idea in the first place.
+>
+> I also compare against the **median**, not the mean, and exclude the day under
+> test from its own baseline. A single 400 DBU day would drag a mean up and
+> suppress detection of the next spike.
+
+### "Why is your cost alert daily when your pipeline alerts are hourly?"
+
+A good interviewer asks this. It tests whether you understand your data source
+rather than just your thresholds.
+
+> Billing data lands with a lag of a few hours. An hourly cost check re-reads
+> the same incomplete day and pages repeatedly about one event. Cadence should
+> match how fast the underlying signal can actually change, not how urgent the
+> topic feels. I run it at 07:30 so the previous day has settled.
+
+### "What does your pipeline actually cost?"
+
+> $59.63 over 30 days for the whole platform, at roughly 5 transactions/second.
+> Per pipeline it's $7.94 for the main streaming pipeline and $1.12 for customer
+> CDC, with the rest on the SQL warehouse.
+>
+> I also track cost per 1,000 rows, because absolute spend says nothing about
+> efficiency — $8 is fine for millions of rows and terrible for four thousand.
+> At my volume that figure is dominated by fixed serverless start-up cost rather
+> than per-row work, so I treat it as a baseline to compare against later rather
+> than a number to be proud of.
+>
+> One caveat I'd state: these are list prices from `system.billing.list_prices`,
+> so they exclude committed-use discounts. It's an estimate for trend and
+> comparison, not an invoice.
+
+
+---
+
 ## Part 10 — Answering honestly about gaps
 
 Being straight here is worth more than a fabricated capability. Every one of
@@ -1159,6 +1255,9 @@ Questions where the intuitive answer is wrong.
 | Does masking a join key break the join? | Yes | No — UC masks at projection time, not on join inputs (but assert it) |
 | Is masking the same as encryption? | Yes | No — PCI 3.3 display vs 3.5 at-rest; masked bytes are still clear on storage |
 | Does an HTTP 200 mean an alert will fire? | Yes | No — a string-bound condition or the v1 API creates inert alerts |
+| Is high total spend the sign of waste? | Yes | No — a nonzero daily *floor* is; totals catch legitimate heavy jobs too |
+| Can you join `list_prices` without filtering? | Yes | No — it is time-ranged; omit `price_end_time IS NULL` and you multiply by every historical price |
+| Should cost alerts run as often as pipeline alerts? | Yes | No — billing lands hours late, so hourly checks re-page on one event |
 
 ---
 
@@ -1213,6 +1312,12 @@ Measured on 2026-08-11. Never quote a number not on this list.
 | Scheduled SQL Alerts | 4 (2 hourly PAGE, 2 daily TICKET) |
 | Watermark lag found | 606.3 hours |
 | State partitions vs configured | 800 vs 16 |
+| **Cost** | |
+| 30-day workspace spend | $395.83 |
+| Attributable to FinGuard | $59.63 |
+| Idle endpoint waste found | $239.35 |
+| Main pipeline 30-day cost | $7.94 |
+| Monthly budget / projection | $300 / $484.71 |
 | **Optimization** | |
 | Files before / after compaction | 117 -> 17 (-85%) |
 | Bytes before / after | 1,372,550 -> 760,366 (-44.6%) |

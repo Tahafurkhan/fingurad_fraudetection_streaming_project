@@ -22,6 +22,27 @@ resources:
       continuous: false
       development: true
 
+      # COST ATTRIBUTION TAGS.
+      #
+      # system.billing.usage carries usage_metadata.dlt_pipeline_id for free, so
+      # per-pipeline cost is already answerable. What it cannot answer is "how
+      # much did DEV cost versus PROD" -- and that question matters here more
+      # than usual, because both bundle targets currently publish to the same
+      # `finguard` catalog, so nothing else distinguishes them in billing.
+      #
+      # These tags propagate into system.billing.usage.custom_tags, which makes
+      # spend groupable by project and environment rather than only by resource
+      # id. Without them, cost analysis can say "pipeline 34149a60 cost $7.94"
+      # but not "this project cost $59.63, of which dev was $12".
+      #
+      # ${bundle.target} resolves to dev or prod at deploy time, so the same
+      # declaration tags each environment correctly.
+      tags:
+        project: finguard
+        environment: ${bundle.target}
+        cost_center: data-engineering
+        owner: tahafurkhan@gmail.com
+
       libraries:
         - glob:
             include: ../src/pipelines/streaming/bronze/**
@@ -109,6 +130,15 @@ resources:
       serverless: true
       continuous: false
       development: true
+
+      # Same attribution scheme as the main pipeline. Tagged separately rather
+      # than inherited: these are two pipelines with independent lifecycles, and
+      # the point of the tags is to make each one's spend visible on its own.
+      tags:
+        project: finguard
+        environment: ${bundle.target}
+        cost_center: data-engineering
+        owner: tahafurkhan@gmail.com
 
       libraries:
         - glob:

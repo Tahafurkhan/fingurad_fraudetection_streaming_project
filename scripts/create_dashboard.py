@@ -153,6 +153,56 @@ DATASETS = [
         ],
     },
     {
+        # Cost by project/environment tag rather than by resource id.
+        #
+        # The "(untagged)" row is the one that matters: it is everything
+        # running in this workspace that no declared resource claims. A
+        # $239 idle serving endpoint lived in that bucket for weeks.
+        "name": "cost_by_tag",
+        "displayName": "Cost by project tag",
+        "queryLines": [
+            "SELECT coalesce(u.custom_tags['project'], '(untagged)') AS project,\n",
+            "       coalesce(u.custom_tags['environment'], '(untagged)') AS environment,\n",
+            "       round(sum(u.usage_quantity), 2) AS dbus,\n",
+            "       round(sum(u.usage_quantity * p.pricing.default), 2) AS est_usd,\n",
+            "       count(DISTINCT u.usage_date) AS active_days\n",
+            "FROM system.billing.usage u\n",
+            "LEFT JOIN system.billing.list_prices p\n",
+            "       ON p.sku_name = u.sku_name\n",
+            "      AND p.currency_code = 'USD'\n",
+            "      AND p.price_end_time IS NULL\n",
+            "WHERE u.usage_date > current_date() - 30\n",
+            "GROUP BY 1, 2\n",
+            "ORDER BY est_usd DESC NULLS LAST",
+        ],
+    },
+    {
+        # Workspace-wide, deliberately. Cost monitoring scoped only to the
+        # pipeline cannot see the resource nobody is watching, and that is
+        # where runaway spend actually lives.
+        "name": "spend_by_sku",
+        "displayName": "Workspace spend by SKU",
+        "queryLines": [
+            "SELECT u.sku_name,\n",
+            "       round(sum(u.usage_quantity), 1) AS dbus,\n",
+            "       round(sum(u.usage_quantity * p.pricing.default), 2) AS est_usd,\n",
+            "       round(min(daily.d), 1) AS daily_floor_dbu\n",
+            "FROM system.billing.usage u\n",
+            "LEFT JOIN system.billing.list_prices p\n",
+            "       ON p.sku_name = u.sku_name\n",
+            "      AND p.currency_code = 'USD'\n",
+            "      AND p.price_end_time IS NULL\n",
+            "LEFT JOIN (SELECT sku_name, usage_date, sum(usage_quantity) AS d\n",
+            "           FROM system.billing.usage\n",
+            "           WHERE usage_date > current_date() - 30\n",
+            "           GROUP BY 1, 2) daily\n",
+            "       ON daily.sku_name = u.sku_name\n",
+            "WHERE u.usage_date > current_date() - 30\n",
+            "GROUP BY u.sku_name\n",
+            "ORDER BY est_usd DESC NULLS LAST",
+        ],
+    },
+    {
         "name": "batch_latency",
         "displayName": "Trigger duration by flow",
         "queryLines": [
@@ -236,6 +286,18 @@ def _serialized_dashboard():
             "w_cost", "cost_per_day", ["day", "pipeline_id", "dbus", "est_usd"],
             "Pipeline cost by day (attribution and trend, not anomaly detection)",
             {"x": 0, "y": 18, "width": 12, "height": 6},
+        ),
+        _table_widget(
+            "w_cost_tag", "cost_by_tag",
+            ["project", "environment", "dbus", "est_usd", "active_days"],
+            "Cost by project tag — '(untagged)' is spend no declared resource claims",
+            {"x": 0, "y": 24, "width": 6, "height": 6},
+        ),
+        _table_widget(
+            "w_sku", "spend_by_sku",
+            ["sku_name", "dbus", "est_usd", "daily_floor_dbu"],
+            "Workspace spend by SKU — a nonzero daily floor means always-on",
+            {"x": 6, "y": 24, "width": 6, "height": 6},
         ),
     ]
 

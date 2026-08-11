@@ -169,8 +169,82 @@ WHERE r.rn = 1 AND s.observations >= 5 AND s.median_rows > 0
 ORDER BY growth_multiple DESC"""
 
 
+COST_SPIKE = """-- PAGE: daily spend far above its own trailing baseline.
+WITH daily AS (
+  SELECT u.usage_date AS usage_date,
+         sum(u.usage_quantity * p.pricing.default) AS usd
+  FROM system.billing.usage u
+  LEFT JOIN system.billing.list_prices p
+         ON p.sku_name = u.sku_name AND p.currency_code = 'USD'
+        AND p.price_end_time IS NULL
+  WHERE u.usage_date > current_date() - 30
+  GROUP BY u.usage_date
+),
+baseline AS (
+  SELECT percentile_approx(usd, 0.5) AS median_usd, count(*) AS baseline_days
+  FROM daily
+  WHERE usage_date BETWEEN current_date() - 15 AND current_date() - 2
+)
+SELECT
+  round(d.usd / nullif(b.median_usd, 0), 2) AS spend_multiple,
+  d.usage_date,
+  round(d.usd, 2)                AS usd_spent,
+  round(b.median_usd, 2)         AS baseline_usd,
+  round(d.usd - b.median_usd, 2) AS excess_usd
+FROM daily d CROSS JOIN baseline b
+WHERE d.usage_date = current_date() - 1
+  AND b.baseline_days >= 7 AND b.median_usd > 0
+  AND d.usd > b.median_usd * 3
+  AND d.usd > 5.00"""
+
+IDLE_COMPUTE = """-- TICKET: always-on compute attached to no job or pipeline.
+SELECT
+  round(sum(daily_dbu), 1) AS dbu_last_7_days,
+  sku_name,
+  round(min(daily_dbu), 1) AS daily_floor_dbu,
+  round(max(daily_dbu), 1) AS daily_peak_dbu,
+  count(*)                 AS days_with_usage
+FROM (
+  SELECT sku_name, usage_date, sum(usage_quantity) AS daily_dbu
+  FROM system.billing.usage
+  WHERE usage_date > current_date() - 8
+    AND usage_metadata.dlt_pipeline_id IS NULL
+    AND usage_metadata.job_id IS NULL
+  GROUP BY sku_name, usage_date
+)
+GROUP BY sku_name
+HAVING min(daily_dbu) > 5 AND count(*) >= 6
+ORDER BY dbu_last_7_days DESC"""
+
+BUDGET_PROJECTION = """-- TICKET: month-to-date spend projects past the monthly budget.
+WITH mtd AS (
+  SELECT sum(u.usage_quantity * p.pricing.default) AS usd_so_far,
+         day(current_date())           AS days_elapsed,
+         day(last_day(current_date())) AS days_in_month
+  FROM system.billing.usage u
+  LEFT JOIN system.billing.list_prices p
+         ON p.sku_name = u.sku_name AND p.currency_code = 'USD'
+        AND p.price_end_time IS NULL
+  WHERE u.usage_date >= date_trunc('MONTH', current_date())
+)
+SELECT
+  round(usd_so_far / nullif(days_elapsed, 0) * days_in_month, 2) AS projected_month_usd,
+  round(usd_so_far, 2) AS spent_so_far_usd,
+  300.00               AS budget_usd,
+  days_elapsed, days_in_month
+FROM mtd
+WHERE days_elapsed >= 5
+  AND usd_so_far / nullif(days_elapsed, 0) * days_in_month > 300.00"""
+
+
 # Severity drives cadence, not just labelling. A PAGE check that runs daily is
 # not a page. A TICKET check that runs every 10 minutes is a mailing list.
+#
+# Cost checks run DAILY even the PAGE one, which looks inconsistent beside the
+# hourly pipeline pages. It is deliberate: billing data lands with a lag of a
+# few hours, so an hourly cost check re-reads the same incomplete day and pages
+# repeatedly about one event. Cadence should match how fast the underlying
+# signal can actually change, not how urgent the topic feels.
 ALERTS = [
     {
         "name": "FinGuard PAGE - pipeline update failed",
@@ -194,6 +268,24 @@ ALERTS = [
         "name": "FinGuard TICKET - state growth unbounded",
         "sql": STATE_GROWTH,
         "column": "growth_multiple",
+        "cron": "0 0 6 * * ?",          # daily 06:00
+    },
+    {
+        "name": "FinGuard PAGE - daily spend spike",
+        "sql": COST_SPIKE,
+        "column": "spend_multiple",
+        "cron": "0 30 7 * * ?",         # daily 07:30, after billing settles
+    },
+    {
+        "name": "FinGuard TICKET - idle compute burning DBU",
+        "sql": IDLE_COMPUTE,
+        "column": "dbu_last_7_days",
+        "cron": "0 0 6 * * ?",          # daily 06:00
+    },
+    {
+        "name": "FinGuard TICKET - monthly budget projection",
+        "sql": BUDGET_PROJECTION,
+        "column": "projected_month_usd",
         "cron": "0 0 6 * * ?",          # daily 06:00
     },
 ]
