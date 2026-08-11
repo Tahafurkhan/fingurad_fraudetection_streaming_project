@@ -39,6 +39,14 @@ resources:
             dependencies:
               - dbt-databricks>=1.12.0,<2.0.0
 
+        # The metrics collector needs no third-party packages -- it is Spark SQL
+        # against the event log. A separate environment rather than reusing
+        # dbt_env so it does not install dbt to run a task that never calls it,
+        # and so a dbt version bump cannot affect monitoring.
+        - environment_key: ops_env
+          spec:
+            client: "3"
+
       tasks:
         # 1. Ingest. Bronze and silver from Kafka, volumes and CDC; streaming
         #    gold alerts computed in the same update.
@@ -111,4 +119,32 @@ resources:
               - "dbt source freshness --target ${bundle.target}"
             warehouse_id: b349348047ac54a2
           # Freshness warnings should not mark the run failed.
+          disable_auto_optimization: true
+
+        # 7. Collect telemetry into the ops tables that alerts query.
+        #
+        #    RUN_IF: ALL_DONE, NOT ALL_SUCCESS. This is the load-bearing detail.
+        #    The run worth diagnosing is the run that failed, so a collector
+        #    that only executes on success gathers evidence for every case
+        #    except the one that matters. `all_done` means it runs whatever
+        #    happened upstream.
+        #
+        #    It depends on the two ingest tasks rather than on dbt_source_
+        #    freshness, because the telemetry it reads comes from the pipeline
+        #    updates. Chaining it behind dbt would make a dbt failure hide
+        #    pipeline diagnostics that were already available.
+        - task_key: collect_metrics
+          depends_on:
+            - task_key: ingest_streaming
+            - task_key: ingest_customers
+          run_if: ALL_DONE
+          spark_python_task:
+            python_file: ../src/pipelines/ops/metrics_collector.py
+            parameters:
+              - "--pipeline-ids"
+              - "${resources.pipelines.finguard_pipeline.id},${resources.pipelines.finguard_customers_pipeline.id}"
+          environment_key: ops_env
+          # Monitoring must not fail the run it monitors. A red pipeline caused
+          # entirely by its own observability is worse than no observability --
+          # it trains people to ignore the colour.
           disable_auto_optimization: true

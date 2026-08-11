@@ -45,6 +45,10 @@ current load deliberately does not.
                     │            OPS                          │
                     │   source_registry  — what should run    │
                     │   ingestion_audit  — what actually ran  │
+                    │                                         │
+                    │   pipeline_runs      ─┐                 │
+                    │   expectation_results ├─ from event log │
+                    │   stream_health      ─┘  → SQL Alerts   │
                     └─────────────────────────────────────────┘
 ```
 
@@ -180,6 +184,7 @@ docs/                  architecture, challenges, interview prep
 | [Setup](docs/setup.md) | Running this on a fresh machine, plus troubleshooting |
 | [Metadata-driven ingestion](docs/metadata_driven_ingestion.md) | Framework design, closure binding, batch vs streaming |
 | [Performance optimization](docs/performance_optimization.md) | Every Spark/Delta optimization applied, in three honest tiers: measured, correct-but-unmeasurable, deliberately rejected |
+| [Observability & monitoring](docs/observability.md) | Event-log telemetry, detectors, alerting and runbook — including two live defects the monitoring found on day one |
 | [Engineering challenges](docs/engineering_challenges.md) | 15 real failures — error text, cause, fix, optimization — including one measured negative result |
 | [Interview preparation](docs/interview_preparation.md) | Scenario-driven Q&A: streaming, Kafka, dimensional modeling, dbt, system design, behavioural |
 
@@ -238,6 +243,14 @@ Stated deliberately — an accurate list is more useful than an impressive one.
   `silver.customers` with `spark.read`, snapshotting a table that is itself
   continuously updating. Customer attribute changes after stream start are not
   reflected in alerts. Fix ties into SCD2 and point-in-time joins.
+- **The `fraud_card_alert` watermark is 606 hours stale.** Found by the
+  monitoring added in [docs/observability.md](docs/observability.md): the
+  stream-stream join stopped advancing event time on 18 June while continuing
+  to report success. Late-arriving records have been dropped silently since.
+- **`shuffle.partitions: 16` does not apply to stateful operators.** They pin
+  partition count into the checkpoint at creation; the join runs 800. Realigning
+  needs a full refresh. Documented in observability.md rather than quietly
+  corrected in the optimization doc.
 - **No dimensional layer.** SCD2 dimensions, star schema and dbt marts are
   planned, not built.
 - **No formal test suite.** Verification scripts exist for the framework;
