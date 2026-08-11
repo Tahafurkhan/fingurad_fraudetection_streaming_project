@@ -18,6 +18,12 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+# The producer is a set of standalone scripts with flat sibling imports
+# (`from schema import ...`), not a package -- it has no __init__.py, so it
+# needs its own directory on the path rather than being reachable through
+# `src` the way `pipelines` is.
+sys.path.insert(0, str(PROJECT_ROOT / "src" / "producer"))
+
 
 @pytest.fixture(autouse=True)
 def stub_pyspark(monkeypatch):

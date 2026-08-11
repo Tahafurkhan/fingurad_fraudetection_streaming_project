@@ -10,6 +10,7 @@ from confluent_kafka import Producer
 from customer_generator import CustomerGenerator
 from fraud_engine import FraudEngine
 from merchant_generator import MerchantGenerator
+from schema import SchemaValidationError, validate_against_schema
 from transaction_generator import TransactionGenerator
 from utils import validate_json_payload
 
@@ -105,6 +106,14 @@ def main() -> None:
             payload = _build_payload(txn)
             if not validate_json_payload(payload):
                 logger.error("Invalid payload generated; skipping")
+                continue
+            # Contract check, distinct from the serialisability check above:
+            # validate_json_payload only proves the dict can be encoded, not
+            # that it has the fields bronze/silver expect.
+            try:
+                validate_against_schema(payload)
+            except SchemaValidationError as exc:
+                logger.error("Payload violates schema contract: %s; skipping", exc)
                 continue
 
             producer.produce(
