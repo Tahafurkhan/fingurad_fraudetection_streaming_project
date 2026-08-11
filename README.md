@@ -179,8 +179,16 @@ docs/                  architecture, challenges, interview prep
 |---|---|
 | [Setup](docs/setup.md) | Running this on a fresh machine, plus troubleshooting |
 | [Metadata-driven ingestion](docs/metadata_driven_ingestion.md) | Framework design, closure binding, batch vs streaming |
-| [Engineering challenges](docs/engineering_challenges.md) | Eight real failures with error text, cause, fix |
-| [Interview preparation](docs/interview_preparation.md) | Answers grounded in what is actually built |
+| [Engineering challenges](docs/engineering_challenges.md) | 15 real failures — error text, cause, fix, optimization — including one measured negative result |
+| [Interview preparation](docs/interview_preparation.md) | Scenario-driven Q&A: streaming, Kafka, dimensional modeling, dbt, system design, behavioural |
+
+The dbt lineage DAG is generated rather than committed (it is build output).
+To browse it:
+
+```bash
+cd transform && source ./set_env.sh
+dbt docs generate --profiles-dir . && dbt docs serve --profiles-dir .
+```
 
 ---
 
