@@ -869,6 +869,188 @@ where they disproved their own claim.
 
 ---
 
+## Part 9b — Governance and security
+
+The round most portfolio projects cannot answer at all. For a fraud platform it
+is not optional: an interviewer will reach PCI within ten minutes.
+
+### "How do you handle PII in a data platform?"
+
+> The distinction that matters is between a *transformation* and a *control*.
+>
+> I originally masked the PAN inside a dbt model and wrote a comment calling it
+> defence in depth. It wasn't. A mask applied in a model protects that model's
+> output. Every other consumer reads the source table: notebooks, JDBC, Power
+> BI, dbt itself. So it was a single layer, applied to the one table an analyst
+> is least likely to open while working a live alert.
+>
+> The control belongs at the catalog boundary. A Unity Catalog column mask
+> protects the column for every reader through every engine, including paths
+> nobody thought about when writing the model:
+>
+> ```sql
+> CREATE FUNCTION finguard.security.mask_pan(pan STRING) RETURN
+>   CASE WHEN is_account_group_member('finguard_pci_privileged') THEN pan
+>        WHEN pan IS NULL THEN NULL
+>        WHEN length(pan) < 8 THEN '****'
+>        ELSE concat('****-****-****-', right(pan, 4)) END;
+> ```
+>
+> Three details are deliberate. NULL in, NULL out — otherwise a NULL PAN becomes
+> the string with nothing after the dashes, which reads as a real empty card and
+> breaks `IS NULL` downstream. The `length < 8` guard, because `right(pan, 4)`
+> on a four-character value returns the whole thing. And the group check first,
+> which is the only reason this is a function rather than a literal expression.
+>
+> It **fails closed**: `is_account_group_member()` returns false for a group
+> that doesn't exist, so a missing group means everyone sees the mask. A control
+> that fails open leaks the first time someone is onboarded in a hurry.
+
+### "How do you know the masking works?"
+
+This is the question that separates candidates. The answer is not "I applied it."
+
+> Six assertions in `sql/governance/03_pii_verification.sql`, because this
+> project has been bitten three times by controls that reported success and did
+> nothing — dbt configs silently ignored, a SQL alert bound to a UUID string,
+> the v1 alerts API that creates inert alerts. `ALTER TABLE ... SET MASK`
+> succeeds whether or not the mask does what you intended.
+>
+> The check that mattered searches for PAN-shaped column names **regardless of
+> whether anyone tagged them** — written on the assumption that my first pass
+> had missed something. Run right after I'd applied and verified six masks, it
+> found two more tables leaking in clear:
+>
+> - `bronze.customers` — my threat model was "transactions carry PANs." But the
+>   customer master carries the card on file, and CDC lands it in bronze before
+>   silver runs.
+> - `snapshots.customers_snapshot` — dbt writes it, so it sat outside my mental
+>   model of "tables the pipeline owns." It's the worst one to miss: an SCD2
+>   snapshot keeps every historical version forever, so it accumulates PANs
+>   that exist nowhere else.
+>
+> A check that validates what you built confirms your assumptions. A check that
+> hunts for what you missed finds bugs.
+
+### "Did masking break anything?"
+
+> That was the risk I was most worried about. `fraud_card_alert` joins on the
+> masked column — `transactions.card_number == fraud_watchlist.entity_id`.
+>
+> If Unity Catalog applied masks to join *inputs* rather than to the output
+> projection, every comparison becomes a masked string compared to a real PAN,
+> the join returns zero rows, fraud detection silently stops, and the pipeline
+> reports success. That is the same silent-failure shape as everything else in
+> my challenges document.
+>
+> UC applies masks at projection time, so it's fine — but "expected to be fine"
+> is exactly the phrase that preceded my last three silent failures, so I
+> asserted it: 375 alerts before, 375 after. `fct_transactions` 4,396 before and
+> after.
+
+### "Is this PCI compliant?"
+
+**Say no.** Claiming compliance is the fastest way to fail the round.
+
+> No. It implements Requirement 3.3 — masking on display, with access limited to
+> a documented business need, which I express as group membership. It does not
+> implement 3.5, at-rest protection, which needs tokenization or managed-key
+> encryption. The bytes are still clear text on storage; the mask is an
+> access-time transformation, so anyone reading the Delta files outside Unity
+> Catalog still sees the PAN.
+>
+> There's also a specific residual exposure I'd rather state than have found:
+> `bronze.transactions.value` holds the raw Kafka payload with the PAN inside a
+> JSON string, across 4,432 rows. A column mask can't reach a substring, and
+> masking the whole column breaks silver, which parses it. The real fix is
+> tokenizing at the producer so the PAN never lands.
+
+### "What breaks your masking?"
+
+> A full refresh. Lakeflow drops and recreates tables, and a recreated table has
+> no masks — no error, no log line, no alert. The `ALTER` statements applied to
+> a table that no longer exists.
+>
+> That's not hypothetical for me: I have a `bronze.transactions` full refresh on
+> the backlog to fix a stale checkpoint, and running it would un-mask everything
+> downstream. CHECK 6 detects the gap; the durable fix is applying masks from
+> the pipeline itself so they're part of table creation rather than a manual
+> follow-up.
+
+---
+
+## Part 9c — When your own monitoring finds your bugs
+
+The strongest available material, because almost no portfolio can demonstrate it.
+
+### "What did your monitoring actually catch?"
+
+> Two real defects, on its first run against real data.
+>
+> **A 606-hour stale watermark.** `fraud_card_alert`'s stream-stream join stopped
+> advancing event time on 18 June and reported success on every run since.
+> Records arriving beyond the frozen watermark are treated as late and dropped
+> silently — which is *correct behaviour* for a watermarked join. The pipeline
+> was doing exactly what it was told. For a fraud alerting path that means alerts
+> that should have fired didn't, and nothing was red.
+>
+> The mechanism is worth explaining: a join's watermark is the **minimum** across
+> its inputs. One quiet source freezes the whole operator even while the other
+> side flows normally.
+>
+> **`shuffle.partitions: 16` was inert on stateful operators.** Telemetry showed
+> the `symmetricHashJoin` running 800 partitions against a configured 16.
+> Stateful operators pin partition count into the checkpoint at creation, because
+> state is partitioned by key and changing the count would redistribute every
+> key. The config applies to stateless shuffles and to checkpoints created after
+> the change — it cannot apply retroactively.
+>
+> That one contradicts a claim in my own optimization document. I recorded the
+> correction in the README's known gaps rather than quietly editing the older
+> doc.
+
+**Why this answer works:** it demonstrates the monitoring is real. Anyone can
+build a dashboard. Having it find something you didn't know was broken — in your
+own project, contradicting your own documentation — is the thing that cannot be
+faked.
+
+### "How do you monitor a Databricks pipeline?"
+
+> Event-log telemetry into three ops tables, then alerts on those rather than on
+> task exit codes. Exit codes can't see the failures that matter — every serious
+> bug in this project returned success.
+>
+> One implementation detail worth knowing: `stream_progress.progress_json` is
+> **doubly encoded** — a JSON string nested inside the details JSON. The obvious
+> query returns NULL rather than erroring:
+>
+> ```sql
+> get_json_object(details, '$.stream_progress.metrics.watermark')  -- NULL
+> ```
+>
+> A monitoring table built on that path fills with NULL watermarks, every stall
+> detector goes quiet, and the monitoring looks healthy precisely because it's
+> broken. I found it by dumping the raw payload instead of trusting the path
+> that should have worked.
+
+### "How do you avoid alert fatigue?"
+
+> Severity drives cadence, not just labelling. A PAGE check that runs daily isn't
+> a page; a TICKET check that runs every ten minutes is a mailing list. I have
+> two hourly PAGE alerts and two daily TICKET alerts.
+>
+> Every detector returns **zero rows when healthy**, and `empty_result_state` is
+> set to OK — left at UNKNOWN, a recovered pipeline never clears. I also
+> disabled notify-on-recovery: recovery mail doubles volume and trains people to
+> skim.
+>
+> And I proved delivery rather than assuming it — created a throwaway alert
+> scheduled two minutes out, watched it reach TRIGGERED with a
+> `last_evaluated_at` timestamp, confirmed the email, then deleted it.
+
+
+---
+
 ## Part 10 — Answering honestly about gaps
 
 Being straight here is worth more than a fabricated capability. Every one of
@@ -876,17 +1058,22 @@ these has a "here is what I would do" attached.
 
 ### "Do you have tests?"
 
-> Two suites. 17 pytest tests covering the framework — config validation
+> Two suites. 42 pytest tests covering the framework — config validation
 > rejection cases, closure binding, the REST reader against a local HTTP
 > server exercising pagination, retry on 5xx, and auth failure. PySpark is
 > stubbed so they run offline in CI without a cluster.
 >
-> And 50 dbt tests on the dimensional layer — uniqueness, not-null,
-> relationships, accepted values — all currently passing.
+> And dbt tests on the dimensional layer — uniqueness, not-null,
+> relationships, accepted values.
 >
-> What is missing is integration testing against a real cluster. The pytest
-> suite proves the framework logic; it cannot prove a Lakeflow pipeline
-> actually builds.
+> **What is missing, and I would say this before being asked.** Those 42 tests
+> cover 3 of 33 source files: config loading, the bronze factory, and the
+> metrics collector. `fraud_engine.py` is 123 lines of seeded, deterministic,
+> pure business logic — the single most testable file in the repository — and
+> it has no tests. That is the first gap I would close.
+>
+> There is also no integration testing against a real cluster. The pytest
+> suite proves framework logic; it cannot prove a Lakeflow pipeline builds.
 
 ### "How do you deploy?"
 
@@ -918,18 +1105,31 @@ modes that have not happened yet.
 
 ### "What's missing that you'd build next?"
 
-> Three things, in priority order.
+> Four things, in priority order.
 >
-> Data contracts between the producer and bronze — right now a producer-side
-> schema change surfaces as a parse failure in silver, which is late.
+> **Backfill as a designed capability.** This is the biggest hole. Right now the
+> only reprocessing primitive is full refresh — all or nothing. A real platform
+> gets asked "the fraud rule was wrong for three weeks, recompute those alerts,"
+> and I can't express that. The property that makes it work is idempotency, and
+> `fct_transactions` already has it via merge on `transaction_id`; the streaming
+> layer doesn't. It also ties directly to my stale-watermark defect, where late
+> records were dropped since 18 June — backfill is the remedy.
 >
-> Alerting on the ops layer. It is queryable but nobody watches a dashboard;
-> at 50 sources it needs to page someone.
+> **Ground truth for detection quality.** My producer generates fraud with known
+> reasons and discards that label at the Kafka boundary, so I cannot compute
+> precision or recall. The platform detects fraud and nobody can say whether
+> it's any good. Carrying `is_fraud` and `fraud_reasons` into bronze fixes it.
 >
-> And per-source pipeline splitting, so one Kafka credential failure does not
-> skip eight downstream flows. Currently the blast radius is bounded by
-> dependency, which is correct, but the dependency graph is larger than it
-> needs to be.
+> **A schema registry.** I'm already on Confluent. Today the Kafka payload is
+> parsed against a hardcoded schema in two places, so a producer-side field
+> addition silently returns null rather than failing. A registry enforces
+> compatibility at publish time instead of parsing defensively downstream.
+>
+> **Reconciliation.** I have `ingestion_audit` recording what ran, but nothing
+> that ties the numbers out — Kafka offsets consumed versus bronze rows versus
+> silver rows, with the deltas explained. Bronze has 4,432 and silver 4,413;
+> something should assert *why* those 19 differ rather than leaving it to
+> inspection.
 
 ---
 
@@ -953,6 +1153,12 @@ Questions where the intuitive answer is wrong.
 | Does liquid clustering always help? | Yes | Not on small tables — one file has nothing to prune |
 | Is `dropDuplicates` safe on a stream? | Yes | No — unbounded state; use `dropDuplicatesWithinWatermark` |
 | Does CDC give one row per entity? | Yes | No — one row per *change*; dedupe before joining or you fan out |
+| Does `shuffle.partitions` apply to stateful operators? | Yes | No — partition count is pinned into the checkpoint at creation |
+| Does a green dbt run mean configs were applied? | Yes | No — dbt accepts unknown config keys silently; verify with `DESCRIBE DETAIL` |
+| Does a column mask survive a pipeline full refresh? | Yes | No — the table is recreated without masks, silently |
+| Does masking a join key break the join? | Yes | No — UC masks at projection time, not on join inputs (but assert it) |
+| Is masking the same as encryption? | Yes | No — PCI 3.3 display vs 3.5 at-rest; masked bytes are still clear on storage |
+| Does an HTTP 200 mean an alert will fire? | Yes | No — a string-bound condition or the v1 API creates inert alerts |
 
 ---
 
@@ -990,11 +1196,26 @@ Measured on 2026-08-11. Never quote a number not on this list.
 | Alerts in mart with point-in-time dims | 353 |
 | High-value alerts | 3 |
 | Ingestion patterns | 4 (Kafka, Auto Loader JSON/CSV, CDC, REST) |
-| pytest tests | 17 passing |
+| pytest tests | 42 passing |
 | dbt tests | 50 passing |
 | Kafka partitions | 6 |
 | Watermark | 5 minutes (fraud), 1 day (merchant dedup) |
 | Throughput | ~5 transactions/second (simulator) |
+| **Governance** | |
+| Column masks applied | 10 |
+| Classification tags | 28 column + 10 table |
+| PAN as seen unprivileged | `****-****-****-9904` |
+| Alert count before/after masking | 375 / 375 (unchanged) |
+| **Observability** | |
+| `ops.pipeline_runs` rows | 49 |
+| `ops.expectation_results` rows | 501 |
+| `ops.stream_health` rows | 585 |
+| Scheduled SQL Alerts | 4 (2 hourly PAGE, 2 daily TICKET) |
+| Watermark lag found | 606.3 hours |
+| State partitions vs configured | 800 vs 16 |
+| **Optimization** | |
+| Files before / after compaction | 117 -> 17 (-85%) |
+| Bytes before / after | 1,372,550 -> 760,366 (-44.6%) |
 
 ### Things not to say
 

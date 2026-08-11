@@ -11,6 +11,12 @@ simulator on serverless compute. It is built to demonstrate architecture and
 patterns at portfolio cost, not to prove throughput. The design scales; the
 current load deliberately does not.
 
+**What makes this different from a tutorial build:** the platform monitors
+itself, and on its first run that monitoring found two real defects in this
+project — a 606-hour stale watermark and a Spark setting that was silently inert
+on stateful operators. Both are documented rather than quietly fixed, including
+the one that contradicts a claim made elsewhere in these docs.
+
 ---
 
 ## Architecture
@@ -32,6 +38,7 @@ current load deliberately does not.
                     │            SILVER                       │
                     │   explicit per-source cleaning          │
                     │   quality expectations, typed schema    │
+                    │   quarantine tables for rejected rows   │
                     └──────────────────┬──────────────────────┘
                                        │
                     ┌──────────────────▼──────────────────────┐
@@ -39,17 +46,26 @@ current load deliberately does not.
                     │   stream-stream join (watermarked)      │
                     │   tumbling + sliding window aggregates  │
                     │   fraud alerts → email sink             │
+                    └──────────────────┬──────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────┐
+                    │            MARTS (dbt)                  │
+                    │   SCD2 dim_customer, dim_merchant       │
+                    │   fct_transactions (point-in-time)      │
+                    │   fct_alerts, aggregates                │
                     └─────────────────────────────────────────┘
 
-                    ┌─────────────────────────────────────────┐
-                    │            OPS                          │
-                    │   source_registry  — what should run    │
-                    │   ingestion_audit  — what actually ran  │
-                    │                                         │
-                    │   pipeline_runs      ─┐                 │
-                    │   expectation_results ├─ from event log │
-                    │   stream_health      ─┘  → SQL Alerts   │
-                    └─────────────────────────────────────────┘
+    ┌──────────────────────────┐   ┌──────────────────────────┐
+    │          OPS             │   │       SECURITY           │
+    │  source_registry         │   │  mask_pan / mask_email   │
+    │  ingestion_audit         │   │  10 column masks         │
+    │                          │   │  28 classification tags  │
+    │  pipeline_runs      ─┐   │   │  3-group access model    │
+    │  expectation_results ├─  │   │                          │
+    │  stream_health      ─┘   │   │  verified by 6 assertions│
+    │   → 4 SQL Alerts         │   │                          │
+    │   → 6-panel dashboard    │   │                          │
+    └──────────────────────────┘   └──────────────────────────┘
 ```
 
 ### Ingestion patterns
@@ -136,8 +152,6 @@ This caught a real gap — `merchants` configured and merged, but no table,
 because a pipeline had not been repointed after a refactor. Grepping YAML
 cannot detect that.
 
-Six operational queries: `sql/ops/health_checks.sql`.
-
 ---
 
 ## Stateful streaming
@@ -150,12 +164,90 @@ retained state; without one the join accumulates forever.
 **Windowed aggregation** — tumbling and sliding one-minute counts for velocity
 detection.
 
-**Quality expectations** — `expect_or_drop` on required identifiers,
-`expect` on amount, with violations recorded in the event log.
+**Quality expectations with quarantine** — `expect_or_drop` on required
+identifiers, `expect` on amount. Rejected rows are routed to quarantine tables
+with the failed rules and full Kafka coordinates, so a rejected message can be
+traced to its offset and replayed after the upstream fix.
 
 **Fraud scoring** — the producer implements 8 weighted signals: impossible
 travel, velocity, card testing, new device, blacklisted merchant, high-risk
 merchant, high value, international.
+
+---
+
+## Dimensional layer (dbt)
+
+| Model | Type | Notes |
+|---|---|---|
+| `dim_customer` | SCD2 | Versioned on the attributes that drive fraud evaluation |
+| `dim_merchant` | SCD2 | Declared vs observed risk |
+| `dim_date` | Generated | 2024–2027 |
+| `fct_transactions` | Incremental merge | Point-in-time dimension joins |
+| `fct_alerts` | Incremental | Detection latency measured, not assumed |
+| `agg_*` | Table | Daily fraud summary, merchant risk profile |
+
+**Point-in-time joins are the reason the layer exists.** A transaction from
+last week is attributed to the customer risk profile that was in force last
+week, not to today's:
+
+```sql
+left join {{ ref('dim_customer') }} c
+       on c.customer_id = t.customer_id
+      and t.transaction_timestamp >= c.valid_from
+      and t.transaction_timestamp <  c.valid_to
+```
+
+Boundary rule: **Lakeflow owns bronze and silver, dbt owns marts.** Nothing is
+defined in both places.
+
+---
+
+## Governance
+
+Unity Catalog column masking, applied and verified:
+
+```sql
+SELECT card_number FROM finguard.silver.transactions LIMIT 1;
+-- before:  4144 88** **** 9904
+-- after:   ****-****-****-9904
+```
+
+| | Before | After |
+|---|---|---|
+| Column masks | 0 | **10** |
+| Classification tags | 0 | **28 column + 10 table** |
+| Access model | `account users BROWSE` | 3 groups, no human write grants |
+
+The mask branches on `is_account_group_member('finguard_pci_privileged')` and
+**fails closed** — a missing group means everyone sees the masked value.
+
+The verification query that searches for PAN-shaped columns *regardless of
+tagging* found two leaks immediately after the first six masks were confirmed
+working: `bronze.customers` (CDC lands the card on file before silver runs) and
+`snapshots.customers_snapshot` (dbt-written, and it retains every historical
+version forever). See [data governance](docs/data_governance.md).
+
+**Not claimed: PCI compliance.** This implements Requirement 3.3 display
+masking. It does not implement 3.5 at-rest protection, which needs
+tokenization — `bronze.transactions.value` still holds PANs inside raw JSON.
+
+---
+
+## Observability
+
+The platform monitors itself from the pipeline event log:
+
+| Table | Contents |
+|---|---|
+| `ops.pipeline_runs` | 49 rows — update outcomes |
+| `ops.expectation_results` | 501 rows — per-expectation pass/fail |
+| `ops.stream_health` | 585 rows — watermarks, state size, batch latency |
+
+Four scheduled SQL Alerts (2 hourly PAGE, 2 daily TICKET) and a six-panel
+dashboard. Severity drives cadence: a PAGE check that runs daily is not a page;
+a TICKET check that runs every ten minutes is a mailing list.
+
+**Two real defects found on the first run** — see Known gaps below.
 
 ---
 
@@ -168,11 +260,16 @@ src/
     framework/         metadata-driven ingestion framework
     streaming/         bronze entry point, silver, gold, alerts
     customers/         customer silver ingestion
+    ops/               event-log telemetry collector
   producer/            Kafka simulator: generators, fraud engine, producers
-resources/             pipeline specs
-sql/ops/               operational queries
-notebooks/             exploration and setup notebooks
-docs/                  architecture, challenges, interview prep
+transform/             dbt project: staging, marts, snapshots
+resources/             Asset Bundle: pipeline and job specs
+scripts/               alert + dashboard provisioning (idempotent)
+sql/
+  ops/                 operational queries, monitoring detectors
+  governance/          PII masking, grants, verification
+tests/                 42 pytest tests
+docs/                  architecture, challenges, governance, interview prep
 ```
 
 ---
@@ -182,14 +279,14 @@ docs/                  architecture, challenges, interview prep
 | Document | Contents |
 |---|---|
 | [Setup](docs/setup.md) | Running this on a fresh machine, plus troubleshooting |
+| [Engineering challenges](docs/engineering_challenges.md) | 17 real failures — error text, root cause, fix, interview angle — including one measured negative result |
+| [Data governance](docs/data_governance.md) | PII masking, classification, access model, and the two leaks the verification found |
+| [Observability & monitoring](docs/observability.md) | Event-log telemetry, detectors, alerting and runbook |
+| [Performance optimization](docs/performance_optimization.md) | 19 optimizations in three honest tiers: measured, correct-but-unmeasurable, deliberately rejected |
 | [Metadata-driven ingestion](docs/metadata_driven_ingestion.md) | Framework design, closure binding, batch vs streaming |
-| [Performance optimization](docs/performance_optimization.md) | Every Spark/Delta optimization applied, in three honest tiers: measured, correct-but-unmeasurable, deliberately rejected |
-| [Observability & monitoring](docs/observability.md) | Event-log telemetry, detectors, alerting and runbook — including two live defects the monitoring found on day one |
-| [Engineering challenges](docs/engineering_challenges.md) | 15 real failures — error text, cause, fix, optimization — including one measured negative result |
-| [Interview preparation](docs/interview_preparation.md) | Scenario-driven Q&A: streaming, Kafka, dimensional modeling, dbt, system design, behavioural |
+| [Interview preparation](docs/interview_preparation.md) | Scenario-driven Q&A: streaming, Kafka, dimensional modeling, dbt, system design |
 
-The dbt lineage DAG is generated rather than committed (it is build output).
-To browse it:
+The dbt lineage DAG is generated rather than committed (it is build output):
 
 ```bash
 cd transform && source ./set_env.sh
@@ -206,29 +303,31 @@ Confluent Cloud cluster.
 ```bash
 python -m venv .venv && .venv\Scripts\activate
 pip install -r src/producer/requirements.txt
-pip install databricks-cli
 
+# The Go CLI, not the legacy Python databricks-cli -- `bundle` requires it.
+# https://docs.databricks.com/dev-tools/cli/install.html
 databricks configure --token --host https://<workspace>.cloud.databricks.com
 ```
 
 Copy `.env.example` to `.env` and `src/producer/.env.example` to
 `src/producer/.env`, then fill in values. Both are gitignored.
 
-Store Kafka connection details in the secret scope:
-
-```python
-# notebooks/exploration/02_Setup_Secret_Scope.ipynb
-```
-
-Generate and upload merchant data:
-
 ```bash
+# Deploy pipelines and the orchestration job
+databricks bundle validate -t dev
+databricks bundle deploy   -t dev
+
+# Governance (create the three account groups first -- see data_governance.md)
+databricks sql -f sql/governance/01_pii_masking.sql
+databricks sql -f sql/governance/02_grants.sql
+databricks sql -f sql/governance/03_pii_verification.sql
+
+# Monitoring
+python scripts/create_alerts.py
+python scripts/create_dashboard.py
+
+# Produce transactions
 cd src/producer && python upload_merchants.py
-```
-
-Start producing transactions:
-
-```bash
 python producer_normal.py          # normal traffic
 python producer_fraud_card.py      # watchlist-matching cards
 ```
@@ -239,29 +338,57 @@ python producer_fraud_card.py      # watchlist-matching cards
 
 Stated deliberately — an accurate list is more useful than an impressive one.
 
-- **Stream-static join bug.** `gold/fraud_card_alert.py` reads
-  `silver.customers` with `spark.read`, snapshotting a table that is itself
-  continuously updating. Customer attribute changes after stream start are not
-  reflected in alerts. Fix ties into SCD2 and point-in-time joins.
-- **The `fraud_card_alert` watermark is 606 hours stale.** Found by the
-  monitoring added in [docs/observability.md](docs/observability.md): the
-  stream-stream join stopped advancing event time on 18 June while continuing
-  to report success. Late-arriving records have been dropped silently since.
+**Found by this project's own monitoring:**
+
+- **The `fraud_card_alert` watermark is 606 hours stale.** The stream-stream
+  join stopped advancing event time on 18 June while continuing to report
+  success on every run. Late-arriving records have been dropped silently since.
+  Remediation needs a checkpoint reset via full refresh, pending confirmation
+  the Kafka topic still holds the source data.
 - **`shuffle.partitions: 16` does not apply to stateful operators.** They pin
-  partition count into the checkpoint at creation; the join runs 800. Realigning
-  needs a full refresh. Documented in observability.md rather than quietly
-  corrected in the optimization doc.
-- **No dimensional layer.** SCD2 dimensions, star schema and dbt marts are
-  planned, not built.
-- **No formal test suite.** Verification scripts exist for the framework;
-  they are not yet pytest with CI.
-- **Deployment is a sync script, not a bundle.** It only uploads, so deleted
-  files persist remotely — which caused a duplicate-table failure. Asset
-  Bundles are the correct fix.
-- **No quarantine table.** Rows dropped by expectations disappear rather than
-  being routed somewhere inspectable.
-- **No measured performance numbers.** Liquid clustering with before/after
-  benchmarks is planned.
+  partition count into the checkpoint at creation; the `symmetricHashJoin` runs
+  800. This contradicts a claim in
+  [performance_optimization.md](docs/performance_optimization.md) — recorded
+  here rather than quietly corrected there.
+
+**Security:**
+
+- **`bronze.transactions.value` retains PANs in clear** — 4,432 rows hold the
+  raw Kafka payload with `card_number` inside JSON. A column mask cannot reach
+  a substring. Real fix is tokenization at the producer.
+- **Masks do not survive a Lakeflow full refresh.** A recreated table has no
+  masks, silently. Re-run `01_pii_masking.sql` after any refresh; CHECK 6
+  detects the gap.
+
+**Correctness:**
+
+- **Stream-static join snapshots a changing table.** `fraud_card_alert` reads
+  `silver.customers` with `spark.read`. CDC fan-out is fixed, but customer
+  attribute changes after stream start are still not reflected in alerts.
+  Point-in-time attribution exists only in the dimensional layer.
+- **Detection latency reads as ~6 hours** in `fct_alerts`, an artifact of
+  triggered-mode runs against stale data rather than a real end-to-end SLA.
+
+**Engineering:**
+
+- **CI has never executed.** The workflow is committed but no pull request has
+  ever been opened, and `dbt-build` is gated on `pull_request`. It also
+  references a `ci` target that `transform/profiles.yml` does not define, so it
+  would fail if run today.
+- **`dev` and `prod` bundle targets write to the same catalog.** The variable is
+  threaded correctly and set to `finguard` in both, so the isolation mechanism
+  exists but is defeated.
+- **Test coverage is 3 of 33 source files** — 42 tests covering config loading,
+  bronze factory and the metrics collector. `fraud_engine.py` is 123 lines of
+  seeded, deterministic logic and is untested.
+- **No fraud-detection ground truth.** The producer generates fraud with known
+  reasons and discards that label at the Kafka boundary, so precision and recall
+  cannot be computed.
+- **No backfill mechanism.** Reprocessing a bounded window is not expressible;
+  the only primitive is full refresh.
+- **No measured query-latency improvement.** Deliberately not claimed — at this
+  data volume the workload is latency-dominated and a clustering benchmark
+  showed warehouse warm-up rather than a real gain.
 
 ---
 
@@ -269,4 +396,4 @@ Stated deliberately — an accurate list is more useful than an impressive one.
 
 Databricks Lakeflow Declarative Pipelines (`pyspark.pipelines`) · Unity Catalog ·
 Delta Lake · Spark Structured Streaming · Auto Loader · Confluent Kafka ·
-Neon Postgres (CDC source) · Python 3.13
+Neon Postgres (CDC source) · dbt · Databricks Asset Bundles · Python 3.13
