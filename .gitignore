@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# Test interpreter with real pyspark. ~400MB, rebuilt by `make venv-test`.
+.venv-test/
 
 # Secrets / local config
 .env

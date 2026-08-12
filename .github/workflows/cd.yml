@@ -1,0 +1,201 @@
+name: CD
+
+# Continuous deployment. CI proves the code is correct; this proves the
+# deployment works.
+#
+# WHAT WAS WRONG BEFORE THIS FILE
+# -------------------------------
+# CI ran five jobs and deployed nothing. `bundle validate` proves the config
+# parses -- it does not prove it deploys, and the two are genuinely different:
+# the prod target failed to validate at all for months because a pipeline
+# carried `development: true`, and nothing surfaced that because nothing ever
+# tried to deploy it.
+#
+# Everything reaching the workspace arrived via `databricks sync` from a
+# laptop. That is not a deployment process; it is a person with credentials.
+#
+# THE PROMOTION PATH
+# ------------------
+#   push to main  ->  deploy dev  ->  smoke test dev
+#                                          |
+#                                          v
+#                          manual dispatch + environment approval
+#                                          |
+#                                          v
+#                            deploy prod  ->  smoke test prod
+#
+# Dev deploys automatically because the cost of a bad dev deploy is a broken
+# dev. Prod requires a human, because the cost of a bad prod deploy is fraud
+# going undetected.
+#
+# AUTHENTICATION
+# --------------
+# OAuth machine-to-machine as the `github-actions-ci-deploy` service principal,
+# not a personal access token. A PAT is tied to a person: it expires, it
+# carries whatever permissions that person happens to have, and every deploy is
+# attributed to them rather than to the pipeline. The service principal is a
+# separate identity whose credential rotation is a deliberate act.
+#
+# Required repository secrets:
+#   DATABRICKS_HOST           https://dbc-xxxx.cloud.databricks.com
+#   DATABRICKS_CLIENT_ID      service principal application id
+#   DATABRICKS_CLIENT_SECRET  service principal OAuth secret
+
+on:
+  push:
+    branches: [main]
+    # Documentation changes do not need a deployment. Skipping them keeps the
+    # deploy history meaningful -- every entry corresponds to something that
+    # could actually have changed behaviour.
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "media/**"
+
+  workflow_dispatch:
+    inputs:
+      deploy_prod:
+        description: "Deploy to production (requires approval)"
+        type: boolean
+        default: false
+
+concurrency:
+  # One deployment at a time. Two concurrent `bundle deploy` runs against the
+  # same target race on workspace state and can leave resources half-updated.
+  #
+  # cancel-in-progress is FALSE deliberately: cancelling a deploy midway is
+  # worse than queueing behind it, because a half-applied bundle is a state
+  # nobody designed for.
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Gate. CD must never deploy something CI has not vetted.
+  #
+  # Re-running the fast checks here rather than trusting that CI passed:
+  # `paths-ignore` and branch protection can both be configured such that a
+  # push reaches CD without a corresponding CI run. Two minutes of duplication
+  # buys certainty about what is being deployed.
+  # ---------------------------------------------------------------------
+  verify:
+    name: Verify before deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest pyyaml ruff
+
+      - name: Lint
+        run: ruff check src/ tests/ scripts/
+
+      - name: Unit and contract tests
+        # The contract-alignment tests matter most here: they assert the
+        # producer schema, the shared transforms module and both silver models
+        # still agree. A drift between them produces no error at runtime -- the
+        # pipeline stays green while a field is silently dropped -- so this is
+        # the last point it can be caught.
+        run: pytest tests/ -v --ignore=tests/integration
+
+  # ---------------------------------------------------------------------
+  # Deploy to dev, automatically.
+  # ---------------------------------------------------------------------
+  deploy-dev:
+    name: Deploy to dev
+    needs: [verify]
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        run: databricks bundle validate -t dev
+
+      - name: Deploy
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        run: databricks bundle deploy -t dev
+
+      - name: Smoke test
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        # Verifies what local tests cannot: Unity Catalog masks are bound to
+        # columns, expectations are registered and evaluating, and the
+        # reconciliation invariant holds against real data. A green pytest run
+        # says the logic is right; this says the deployment worked.
+        run: python scripts/smoke_test.py --target dev
+
+  # ---------------------------------------------------------------------
+  # Deploy to prod. Manual dispatch plus a GitHub environment approval.
+  #
+  # TWO GATES, NOT ONE. `workflow_dispatch` means a human chose to deploy;
+  # the `production` environment's protection rule means a human approved it.
+  # On a solo project those are the same person, which is why this is
+  # deliberately a bit tedious -- the friction is the control.
+  # ---------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to production
+    needs: [deploy-dev]
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_prod
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        # `mode: production` makes this stricter than the dev validation: it
+        # refuses a pipeline with development=true and refuses to deploy a
+        # tree that differs from what is committed.
+        run: databricks bundle validate -t prod
+
+      - name: Deploy
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        run: databricks bundle deploy -t prod
+
+      - name: Smoke test
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        run: python scripts/smoke_test.py --target prod
+
+      - name: Summary
+        if: always()
+        # Written to the run summary rather than only to logs, so the
+        # deployment record survives log retention and is readable without
+        # expanding job steps.
+        run: |
+          {
+            echo "### Production deployment"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA:0:8}\` |"
+            echo "| Actor | @${GITHUB_ACTOR} |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

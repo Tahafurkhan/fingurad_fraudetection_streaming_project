@@ -69,7 +69,52 @@ jobs:
       - name: Run tests
         # The framework is deliberately testable without a cluster: config
         # loading, validation and closure binding are all pure Python.
-        run: pytest tests/ -v
+        #
+        # Integration tests are excluded here and run in their own job below:
+        # they need real pyspark and a JVM, which would make this fast job slow
+        # for every contributor who only touched a config file.
+        run: pytest tests/ -v --ignore=tests/integration
+
+  test-integration:
+    name: Integration tests (real Spark)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Spark is a JVM application; pyspark only wraps it.
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache pip
+        # pyspark is ~300MB. Without a cache every run re-downloads it, which
+        # costs more wall-clock than executing the tests.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-integration-${{ hashFiles('requirements-test.txt') }}
+
+      - name: Install test dependencies
+        # Note what is NOT installed: databricks-connect. It replaces the
+        # pyspark package with a client that refuses to create a local session,
+        # which is why developers need a separate .venv-test locally. A CI
+        # runner starts clean, so real pyspark installs directly and no
+        # isolation is needed here.
+        run: pip install -r requirements-test.txt
+
+      - name: Run integration tests
+        # These execute real transformations against real DataFrames: JSON
+        # parsing, quality routing, and the DQ-06 reconciliation invariant.
+        # What they do NOT cover is anything platform-specific -- Unity Catalog
+        # grants, Lakeflow expectation accounting, liquid clustering -- which
+        # needs a workspace and belongs in a post-deploy smoke test.
+        run: pytest tests/integration -v
 
   validate-bundle:
     name: Validate Asset Bundle

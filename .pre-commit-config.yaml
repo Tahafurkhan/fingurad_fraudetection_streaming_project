@@ -1,0 +1,110 @@
+# Pre-commit hooks -- the same checks CI runs, moved to the point of commit.
+#
+# WHY BOTHER, GIVEN CI ALREADY RUNS THESE
+# ---------------------------------------
+# Not to replace CI. CI stays the gate, because a hook can be skipped with
+# --no-verify and a hook only sees what a developer happened to stage.
+#
+# The value is feedback latency. A lint failure caught here costs seconds; the
+# same failure caught in CI costs a push, a runner queue, a red badge, a
+# context switch back to code you had stopped thinking about, and a second
+# commit that says "fix lint". The check is identical -- only the cost of
+# being wrong changes.
+#
+# Install with: make hooks
+#
+# WHAT IS DELIBERATELY NOT HERE: pytest. The unit suite runs in ~2 seconds and
+# would be tempting to add, but the integration suite needs .venv-test and
+# takes ~40. A hook slow enough to interrupt thought is a hook people disable,
+# and a disabled hook protects nothing. Tests stay in CI and in `make test`.
+
+repos:
+  # ---------------------------------------------------------------------
+  # Secrets. First, and non-negotiable.
+  #
+  # A committed credential is not undone by a later commit -- it stays in the
+  # object history and must be treated as compromised the moment it is pushed.
+  # This is the one hook whose whole value is being unskippable-by-habit,
+  # because the cost of a miss is a rotation, not a reformat.
+  # ---------------------------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        name: Detect hardcoded secrets
+
+  # ---------------------------------------------------------------------
+  # Python lint and format. Same ruff config as CI (pyproject.toml), so a
+  # local pass means a CI pass -- if the two configs diverged, the hook would
+  # be worse than nothing: it would grant false confidence.
+  # ---------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff
+        name: Lint Python
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+        name: Format Python
+        # Checks only. Reformatting streaming models in a commit hook would
+        # silently rewrite working Spark code the author did not touch.
+        args: [--diff]
+
+  # ---------------------------------------------------------------------
+  # File hygiene.
+  # ---------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        name: Validate YAML
+        # The ingestion framework is metadata-driven: config/sources/*.yaml
+        # becomes pipeline code. A YAML typo is not a formatting problem, it is
+        # a pipeline that fails at deploy time with a parse error far from its
+        # cause.
+        exclude: ^transform/(target|dbt_packages)/
+
+      - id: check-json
+      - id: check-toml
+
+      - id: check-added-large-files
+        # Delta files, jars or a stray parquet dump committed by accident are
+        # effectively permanent -- git history keeps them even after deletion.
+        args: [--maxkb=5000]
+
+      - id: end-of-file-fixer
+        exclude: ^(media/|transform/(target|dbt_packages)/)
+      - id: trailing-whitespace
+        exclude: ^(media/|transform/(target|dbt_packages)/)
+
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+      - id: no-commit-to-branch
+        # Direct commits to main bypass review entirely. Not a security
+        # control -- it is trivially overridden -- but it turns an absent-minded
+        # `git commit` on the wrong branch into a prompt.
+        args: [--branch, main]
+
+  # ---------------------------------------------------------------------
+  # Project-specific: the contract-drift check.
+  #
+  # The transaction contract is written in four files (producer schema, shared
+  # transforms module, silver model, quarantine model) because Lakeflow's
+  # exec() model prevents pipeline files from importing a shared constant.
+  # Four copies drift, and a drift produces NO error -- from_json returns null
+  # for the field the stale schema omits, and the pipeline stays green while
+  # the data goes quietly wrong.
+  #
+  # Fast (~2s, no Spark), so it earns its place in a hook: editing one of the
+  # four files and not the others is exactly the mistake this catches, and
+  # exactly the moment to catch it.
+  # ---------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: contract-alignment
+        name: Transaction contract is consistent across all four definitions
+        entry: python -m pytest tests/test_contract_alignment.py -q
+        language: system
+        pass_filenames: false
+        files: ^(src/producer/schema\.py|src/pipelines/transforms/.*\.py|src/pipelines/streaming/silver/(fingurad_silver|transactions_quarantine)\.py)$

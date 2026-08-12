@@ -1,0 +1,24 @@
+# Test-only dependencies. Installed into .venv-test, NEVER into the global
+# environment -- pyspark here would collide with databricks-connect there.
+# See the Makefile header for why the two cannot share an interpreter.
+
+# Pinned to the minor version Databricks Runtime 15.x ships. Transformation
+# semantics are stable across patch releases, but pinning the minor version
+# means a local pass is evidence about the runtime that will actually execute
+# the code, not about whatever pyspark pip resolved to today.
+pyspark==3.5.3
+
+# Delta is not exercised by the current tests -- they operate on in-memory
+# DataFrames rather than tables. Included because the moment a test needs to
+# assert MERGE behaviour or time travel, it needs this, and discovering that
+# mid-test is a worse time to find out.
+delta-spark==3.2.0
+
+pytest>=8.0
+pytest-cov>=5.0
+
+# DataFrame equality with readable diffs. Comparing collect() output by hand
+# reports "lists differ" and leaves you to find which of 16 columns moved.
+chispa>=0.10
+
+pyyaml>=6.0

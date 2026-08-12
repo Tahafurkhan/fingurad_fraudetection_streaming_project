@@ -42,3 +42,14 @@ select = ["E", "F", "W", "I", "UP", "B"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+
+# Integration tests need a real SparkSession, which the global interpreter
+# cannot create -- databricks-connect replaces the pyspark package with a
+# client that refuses local sessions. They skip there and run in .venv-test.
+#
+#   make test              unit only, global interpreter, ~2s
+#   make test-integration  real Spark in .venv-test, ~40s
+#   make test-all          both
+markers = [
+    "integration: requires a real SparkSession (run via .venv-test)",
+]
