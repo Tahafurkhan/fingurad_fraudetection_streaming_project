@@ -131,3 +131,78 @@ models:
         data_tests: [not_null]
       - name: is_high_value
         data_tests: [not_null]
+
+      - name: date_key
+        description: >
+          Foreign key to dim_date, derived from transaction_timestamp (event
+          time), never from load time. A transaction that occurred on the 10th
+          and arrived on the 13th belongs to the 10th.
+        data_tests:
+          - not_null
+          # The relationships test is the one that earns its place here.
+          # dim_date is generated over a fixed range (2024-2027), so a
+          # transaction outside that range produces a key pointing at nothing.
+          # Every join to the calendar silently drops those rows, and a daily
+          # report simply omits a day rather than failing. Bad source
+          # timestamps are exactly how that happens: an epoch-0 default lands
+          # in 1970, a millisecond timestamp read as seconds lands in the far
+          # future.
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+
+      - name: arrival_delay_hours
+        description: >
+          Event time to silver arrival, in hours. Upstream delivery delay --
+          not this platform's processing time, which lives in ops.job_sla.
+        data_tests:
+          - not_null
+          # Negative delay means a transaction arrived before it happened,
+          # which is a clock problem, not a data problem: a producer with a
+          # skewed clock, or a timestamp stamped at the wrong stage. Worth
+          # failing on, because every watermark in the streaming layer assumes
+          # event time is broadly well-behaved (TRD ASM-05) and a negative
+          # value is direct evidence that assumption has broken.
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+
+      - name: is_late_arrival
+        description: Landed on a later calendar day than it occurred.
+        data_tests: [not_null]
+
+      - name: arrival_delay_days
+        description: >
+          Whole days between event time and silver arrival. Compared against
+          late_arrival_window_days to detect the incremental overlap window
+          becoming too narrow.
+        data_tests: [not_null]
+
+  - name: late_arrival_monitor
+    description: >
+      Daily arrival-delay profile. Makes the incremental overlap window an
+      evidence-based setting rather than a guess, and gives alerting a column
+      to watch before the window starts silently dropping rows.
+    columns:
+      - name: transaction_date
+        data_tests: [not_null, unique]
+      - name: transactions
+        data_tests: [not_null]
+      - name: late_pct
+        description: Percentage of the day's transactions that crossed a day boundary.
+      - name: p95_delay_hours
+        description: >
+          Reported alongside the average because arrival delay is heavily
+          right-skewed -- nearly everything lands in seconds and a few retries
+          land hours later, so the mean describes no actual transaction.
+      - name: headroom_days
+        description: >
+          Slack remaining before the overlap window stops covering observed
+          lateness. The column an alert should watch: it reaches zero before
+          data goes missing.
+        data_tests: [not_null]
+      - name: window_status
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["OK", "AT_RISK", "BREACHED"]

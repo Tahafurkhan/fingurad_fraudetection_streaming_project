@@ -62,3 +62,22 @@ vars:
   # Fraud-scoring threshold, referenced by marts rather than hardcoded per
   # model so the rule lives in one place.
   high_value_threshold: 100000
+
+  # How far back fct_transactions reprocesses on every incremental run.
+  #
+  # THIS IS A CORRECTNESS SETTING, NOT A PERFORMANCE ONE. Silver is fed by a
+  # watermarked stream, so a transaction can land after transactions with later
+  # event times. The incremental filter takes rows newer than
+  # `max(transaction_timestamp) - this`, so anything arriving later than this
+  # window never matches the filter -- and is not rejected, quarantined or
+  # logged. It simply never appears, in a run that reports success.
+  #
+  # Too small silently loses rows. Too large reprocesses history every run for
+  # stragglers that arrived in seconds. marts.late_arrival_monitor measures
+  # which of those is happening, so this can be set from evidence.
+  #
+  # Referenced by fct_transactions (the filter) and late_arrival_monitor (the
+  # headroom calculation). Defined once so the two cannot disagree about what
+  # the window is -- a monitor reporting headroom against a different number
+  # than the filter uses would be worse than no monitor.
+  late_arrival_window_days: 3

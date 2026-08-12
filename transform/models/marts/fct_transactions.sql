@@ -37,6 +37,43 @@
 -- the same window the source filter uses means the merge only touches recent
 -- files, which is the difference between a merge that scales and one that
 -- degrades.
+--
+-- WHY THERE IS NO incremental_predicates HERE ANY MORE.
+--
+-- There was. It bounded the target side to a few days:
+--
+--     DBT_INTERNAL_DEST.transaction_timestamp >= current_timestamp()
+--         - interval 4 days
+--
+-- and it produced duplicate transaction_ids in production. The unique test
+-- caught four:
+--
+--     TXN502842  transaction_timestamp 2026-07-13, loaded 2026-08-11
+--     TXN502842  transaction_timestamp 2026-08-11, loaded 2026-08-12
+--
+-- Same business key, event times a month apart. The predicate meant MERGE only
+-- considered target rows from the last four days as match candidates, so the
+-- July copy was invisible and MERGE inserted rather than updated.
+--
+-- The cause is upstream and legitimate: bronze reads `startingOffsets:
+-- earliest`, so a checkpoint reset replays the retention window and the same
+-- transaction_id arrives again carrying a *different* event timestamp. The
+-- model already documents this for the source-side dedup ("TXN266669 exists at
+-- partition 1 offsets 146 and 392 with different event timestamps") -- the
+-- error was assuming the target side could be bounded by event time when the
+-- key it matches on is not event-time-correlated at all.
+--
+-- ANY time-bounded predicate is wrong here for that reason, not just a
+-- too-narrow one: a redelivery can carry any event time within the retention
+-- window, so no window short enough to help is also wide enough to be correct.
+-- Widening it to cover retention would scan the whole table anyway, which is
+-- what the predicate existed to avoid.
+--
+-- The cost of removing it is a full-target scan per merge, which grows with
+-- history. That is a real scaling concern and the honest mitigation is liquid
+-- clustering on transaction_date plus Delta's file skipping, not a predicate
+-- that trades correctness for speed. Revisit if merge time becomes the
+-- bottleneck; correctness first.
 {{
     config(
         materialized='incremental',
@@ -44,11 +81,7 @@
         incremental_strategy='merge',
         file_format='delta',
         on_schema_change='append_new_columns',
-        liquid_clustered_by=['customer_id', 'transaction_date'],
-        incremental_predicates=[
-            "DBT_INTERNAL_DEST.transaction_timestamp >= "
-            "current_timestamp() - interval 4 days"
-        ]
+        liquid_clustered_by=['customer_id', 'transaction_date']
     )
 }}
 
@@ -58,13 +91,18 @@ with source_transactions as (
 
     {% if is_incremental() %}
     -- Only consider transactions newer than what has already been loaded.
-    -- The 3-day overlap is deliberate: silver is fed by a watermarked stream,
-    -- so a transaction can land after transactions with later event times.
-    -- Without the overlap those stragglers would be skipped permanently.
-    -- merge on transaction_id makes reprocessing the overlap idempotent.
+    -- The overlap is deliberate: silver is fed by a watermarked stream, so a
+    -- transaction can land after transactions with later event times. Without
+    -- the overlap those stragglers would be skipped permanently. merge on
+    -- transaction_id makes reprocessing the overlap idempotent.
+    --
+    -- The window comes from the `late_arrival_window_days` var rather than
+    -- being written here, because marts.late_arrival_monitor computes headroom
+    -- against the same number. A monitor reporting slack against a different
+    -- window than the filter actually uses would be actively misleading.
     where transaction_timestamp >= (
         select coalesce(max(transaction_timestamp), timestamp '1900-01-01')
-               - interval 3 days
+               - interval {{ var('late_arrival_window_days') }} days
         from {{ this }}
     )
     {% endif %}
@@ -149,6 +187,19 @@ select
     c.customer_sk,
     m.merchant_sk,
 
+    -- Date key. Conforms this fact to dim_date, which fct_alerts already used
+    -- and this table did not -- so the two facts could not be sliced by the
+    -- same calendar without one of them recomputing date parts inline. That is
+    -- exactly the inconsistency a date dimension exists to prevent: two
+    -- analysts deriving "is_weekend" separately and disagreeing about whether
+    -- the week starts on Sunday.
+    --
+    -- Derived from transaction_timestamp (event time), never from
+    -- dbt_loaded_at. A transaction that occurred on the 10th and arrived on the
+    -- 13th belongs to the 10th; keying it by arrival would move revenue between
+    -- days and make every daily total unreproducible.
+    cast(date_format(t.transaction_timestamp, 'yyyyMMdd') as int) as date_key,
+
     -- Natural keys retained for traceability and ad-hoc querying.
     t.customer_id,
     t.merchant_id,
@@ -183,6 +234,66 @@ select
 
     t.transaction_timestamp,
     t.transaction_date,
+
+    -- ---------------------------------------------------------------
+    -- LATE ARRIVAL MEASUREMENT
+    --
+    -- The 3-day overlap above handles late arrivals defensively: it
+    -- reprocesses a window so stragglers are not skipped. What it never did
+    -- was RECORD anything, which leaves two questions unanswerable.
+    --
+    --   1. Is 3 days the right window? It was chosen by judgement. If real
+    --      lateness is under an hour it is wasteful; if anything exceeds
+    --      3 days it is silently losing rows. Both cases look identical from
+    --      outside -- a green run, a plausible row count.
+    --
+    --   2. Did we lose anything? A transaction arriving outside the window is
+    --      not rejected or quarantined. It simply never matches the source
+    --      filter, and no table anywhere records that it existed.
+    --
+    -- Measuring it costs three columns and makes the window an evidence-based
+    -- setting instead of a guess. See marts.late_arrival_monitor for the
+    -- aggregate and the alerting threshold.
+    -- ---------------------------------------------------------------
+
+    -- Event time to landing in silver. This is arrival lateness as the
+    -- warehouse can observe it: the delay between the transaction occurring
+    -- and this platform having it available to model.
+    --
+    -- silver_ingestion_timestamp rather than bronze: bronze is when the
+    -- message was received, silver is when it became a usable typed row. The
+    -- gap between them is this platform's own processing latency, which
+    -- belongs in the SLA tables, not in a fact about the transaction.
+    round(
+        (unix_timestamp(t.silver_ingestion_timestamp)
+         - unix_timestamp(t.transaction_timestamp)) / 3600.0,
+        3
+    ) as arrival_delay_hours,
+
+    -- Whether this row arrived late enough to have needed the overlap window.
+    -- A row is "late" when it landed on a later calendar day than it occurred.
+    -- Day granularity rather than a fixed number of hours because the fact is
+    -- reported daily: a transaction that crosses a day boundary is the one
+    -- that changes an already-published daily total.
+    t.silver_ingestion_timestamp::date > t.transaction_timestamp::date
+        as is_late_arrival,
+
+    -- THE ONE THAT MATTERS FOR TUNING THE WINDOW.
+    --
+    -- How close this row came to falling outside the 3-day overlap. A value
+    -- approaching 3 means the window is about to start losing data silently.
+    -- Exposed as a plain number so an alert can watch max() rather than
+    -- someone remembering to check.
+    --
+    -- Rows that DID fall outside the window cannot appear here -- they never
+    -- entered the model. That is the honest limit of this measurement: it
+    -- shows the window narrowing, not what has already been lost. Bounding
+    -- that requires reconciling against bronze, which is what the
+    -- reconciliation check in ops does.
+    round(
+        datediff(t.silver_ingestion_timestamp, t.transaction_timestamp),
+        0
+    ) as arrival_delay_days,
 
     -- Kafka provenance, carried all the way to the mart.
     t.kafka_topic,
