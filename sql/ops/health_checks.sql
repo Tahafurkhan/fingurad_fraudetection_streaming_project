@@ -102,3 +102,62 @@ FROM finguard.ops.ingestion_audit
 WHERE status = 'FAILED'
 GROUP BY source_name
 ORDER BY failure_count DESC;
+
+
+-- ---------------------------------------------------------------------------
+-- 7. Late-arrival window headroom.
+--
+--    Answers: is the incremental overlap window in fct_transactions still wide
+--    enough, or is it about to start silently dropping rows?
+--
+--    WHY THIS NEEDS A QUERY RATHER THAN A GLANCE. The failure it guards
+--    against produces no error. A transaction arriving after the overlap
+--    window never matches the incremental filter -- it is not rejected, not
+--    quarantined, not logged. The run is green and the row simply is not
+--    there. The only warning available is watching how close observed
+--    lateness gets to the window before that happens.
+--
+--    READ `headroom_days` AS THE ALERT COLUMN. It reaches zero *before* loss
+--    becomes possible, which is what makes it actionable. `window_status =
+--    'BREACHED'` does NOT mean data was lost -- rows that fell outside the
+--    window are not in this table at all. It means the window is no longer
+--    known to be sufficient, which is the last warning there is.
+-- ---------------------------------------------------------------------------
+SELECT transaction_date,
+       transactions,
+       late_transactions,
+       late_pct,
+       p95_delay_hours,
+       max_delay_hours,
+       max_delay_days,
+       window_days,
+       headroom_days,
+       window_status
+FROM finguard.marts.late_arrival_monitor
+WHERE transaction_date > current_date() - INTERVAL 30 DAYS
+ORDER BY transaction_date DESC;
+
+
+-- ---------------------------------------------------------------------------
+-- 8. Window tuning evidence.
+--
+--    The other half of the question. Check 7 asks whether the window is too
+--    NARROW; this asks whether it is too WIDE -- reprocessing days of history
+--    on every run to catch stragglers that all arrive within minutes.
+--
+--    If p99 across the whole period is a small number of hours, the window is
+--    paying for lateness that does not occur. Reducing it is a real saving,
+--    and unlike most tuning it can be justified from data rather than
+--    asserted.
+-- ---------------------------------------------------------------------------
+SELECT round(percentile_approx(p50_delay_hours, 0.5), 3)  AS typical_p50_hours,
+       round(percentile_approx(p95_delay_hours, 0.5), 3)  AS typical_p95_hours,
+       round(max(p99_delay_hours), 3)                     AS worst_p99_hours,
+       round(max(max_delay_hours), 3)                     AS worst_case_hours,
+       max(max_delay_days)                                AS worst_case_days,
+       max(window_days)                                   AS configured_window_days,
+       sum(late_transactions)                             AS total_late,
+       sum(transactions)                                  AS total_transactions,
+       round(100.0 * sum(late_transactions) / nullif(sum(transactions), 0), 3)
+                                                          AS overall_late_pct
+FROM finguard.marts.late_arrival_monitor;

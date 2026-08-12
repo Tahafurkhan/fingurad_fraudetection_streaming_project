@@ -47,12 +47,46 @@ WAREHOUSE_ID = "b349348047ac54a2"
 NOTIFY_EMAIL = "tahafurkhan@gmail.com"
 TIMEZONE = "Asia/Kolkata"
 
+# Must match SLACK_DESTINATION_NAME in create_notification_destinations.py.
+# The destination is resolved by name at runtime rather than by a hardcoded id,
+# so rotating the Slack webhook (which recreates nothing but updates the same
+# destination) needs no change here.
+SLACK_DESTINATION_NAME = "FinGuard PAGE - Slack"
+
 
 def _client():
+    """Resolve host and auth headers.
+
+    Prefers a personal access token from ~/.databrickscfg, falling back to the
+    CLI's OAuth session. The fallback is not optional on a workspace configured
+    for OAuth: there is no `token` key in the config file at all, and reading
+    it raises KeyError before any API call is attempted.
+
+    `databricks auth token` prints the current OAuth access token, refreshing
+    it if needed, which is the supported way to borrow the CLI's session for
+    raw HTTP.
+    """
     cfg = configparser.ConfigParser()
     cfg.read(os.path.expanduser("~/.databrickscfg"))
-    host = cfg["DEFAULT"]["host"].rstrip("/")
-    token = cfg["DEFAULT"]["token"]
+    section = cfg["DEFAULT"]
+    host = section["host"].rstrip("/")
+
+    token = section.get("token")
+    if not token:
+        import subprocess
+
+        result = subprocess.run(
+            ["databricks", "auth", "token", "--profile", "DEFAULT"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(
+                "No token in ~/.databrickscfg and `databricks auth token` "
+                f"failed:\n{result.stderr.strip()[:300]}"
+            )
+        token = json.loads(result.stdout)["access_token"]
+
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     return host, headers
 
@@ -245,53 +279,172 @@ WHERE days_elapsed >= 5
 # few hours, so an hourly cost check re-reads the same incomplete day and pages
 # repeatedly about one event. Cadence should match how fast the underlying
 # signal can actually change, not how urgent the topic feels.
+#
+# ---------------------------------------------------------------------------
+# Distribution and staleness detectors.
+#
+# These select from views in sql/ops/distribution_views.sql rather than
+# inlining their logic. An alert stores its own copy of the query text, so
+# inlining would mean editing the file leaves the alert running the old
+# version with nothing reporting the divergence. One definition, in the view.
+#
+# Each view already returns rows only when something is wrong, so the alert
+# query is a plain select and the bound column is the view's leading numeric.
+# ---------------------------------------------------------------------------
+
+MART_LAG = """-- PAGE: the marts have stopped tracking silver.
+-- Written after finding fct_transactions a month stale while every other
+-- check reported healthy -- the orchestration job was paused and nothing
+-- watched whether it ran.
+SELECT mart_lag_days, silver_newest, mart_newest, silver_rows, mart_rows
+FROM finguard.ops.v_marts_lag"""
+
+ALERT_RATE_SHIFT = """-- PAGE: fraud alert volume has collapsed or spiked.
+-- Alerts stopping looks identical to fraud stopping, and the first is far
+-- more likely. This is the detector that watches the detectors.
+SELECT alert_rate_multiple, alerts_today, baseline_alerts_per_day,
+       transactions_today, diagnosis
+FROM finguard.ops.v_alert_rate_shift"""
+
+AMOUNT_DISTRIBUTION = """-- TICKET: the transaction amount distribution has shifted.
+-- Every row can be individually valid while the aggregate shape changes,
+-- which is exactly what a fraud pattern shift looks like.
+SELECT median_shift_multiple, p95_shift_multiple, baseline_median,
+       current_median, baseline_p95, current_p95, current_rows
+FROM finguard.ops.v_amount_distribution_shift"""
+
+CATEGORICAL_MIX = """-- TICKET: a category's share of volume has moved materially.
+-- A fraud ring in one geography, or a compromised channel, changes a
+-- category's share while no individual transaction is invalid.
+SELECT share_change_points, dimension, value, baseline_pct, current_pct,
+       current_rows, change_type
+FROM finguard.ops.v_categorical_mix_shift"""
+
+#
+# ROUTING: `page` decides the CHANNEL, cron decides the CADENCE.
+#
+# A PAGE alert notifies Slack *and* email; a TICKET alert notifies email only.
+# The reason is not that Slack is fancier -- it is that a Slack channel
+# receiving every alert becomes unreadable within a week, and an unread channel
+# looks like coverage while providing none.
+#
+# TRD OB-07 requires page and notify to be distinguishable. Sending both to the
+# same place erases exactly the distinction it asks for. The test is simple:
+# is there an action a person can take right now? Ingestion has stopped -- yes.
+# A monthly budget projection moved -- no, that is a Monday conversation.
 ALERTS = [
     {
         "name": "FinGuard PAGE - pipeline update failed",
         "sql": UPDATE_FAILED,
         "column": "failure_count",
         "cron": "0 5 * * * ?",          # hourly at :05
+        "page": True,
     },
     {
         "name": "FinGuard PAGE - watermark stalled",
         "sql": WATERMARK_STALLED,
         "column": "watermark_lag_hours",
         "cron": "0 5 * * * ?",          # hourly at :05
+        "page": True,
     },
     {
         "name": "FinGuard TICKET - expectation rate degraded",
         "sql": EXPECTATION_DEGRADED,
         "column": "drop_pct_points",
         "cron": "0 0 6 * * ?",          # daily 06:00
+        "page": False,
     },
     {
         "name": "FinGuard TICKET - state growth unbounded",
         "sql": STATE_GROWTH,
         "column": "growth_multiple",
         "cron": "0 0 6 * * ?",          # daily 06:00
+        "page": False,
     },
     {
+        # PAGE, but daily -- deliberately. Billing data lands hours late, so an
+        # hourly check would re-read the same incomplete day and page
+        # repeatedly about one event. Urgent topic, slow-moving signal.
         "name": "FinGuard PAGE - daily spend spike",
         "sql": COST_SPIKE,
         "column": "spend_multiple",
         "cron": "0 30 7 * * ?",         # daily 07:30, after billing settles
+        "page": True,
     },
     {
         "name": "FinGuard TICKET - idle compute burning DBU",
         "sql": IDLE_COMPUTE,
         "column": "dbu_last_7_days",
         "cron": "0 0 6 * * ?",          # daily 06:00
+        "page": False,
     },
     {
         "name": "FinGuard TICKET - monthly budget projection",
         "sql": BUDGET_PROJECTION,
         "column": "projected_month_usd",
         "cron": "0 0 6 * * ?",          # daily 06:00
+        "page": False,
+    },
+    {
+        # PAGE: a stale mart serves plausible wrong numbers with no error.
+        # Daily rather than hourly -- the upstream job is daily, so an hourly
+        # check would re-report the same known gap all day.
+        "name": "FinGuard PAGE - marts stale vs silver",
+        "sql": MART_LAG,
+        "column": "mart_lag_days",
+        "cron": "0 0 8 * * ?",          # daily 08:00, after the 02:00 job
+        "page": True,
+    },
+    {
+        "name": "FinGuard PAGE - fraud alert rate shift",
+        "sql": ALERT_RATE_SHIFT,
+        "column": "alert_rate_multiple",
+        "cron": "0 15 * * * ?",         # hourly at :15
+        "page": True,
+    },
+    {
+        # TICKET: a distribution shift is worth investigating, not worth
+        # waking someone. Interpreting it needs context an analyst has and a
+        # sleeping engineer does not.
+        "name": "FinGuard TICKET - amount distribution shift",
+        "sql": AMOUNT_DISTRIBUTION,
+        "column": "median_shift_multiple",
+        "cron": "0 0 7 * * ?",          # daily 07:00
+        "page": False,
+    },
+    {
+        "name": "FinGuard TICKET - categorical mix shift",
+        "sql": CATEGORICAL_MIX,
+        "column": "share_change_points",
+        "cron": "0 0 7 * * ?",          # daily 07:00
+        "page": False,
     },
 ]
 
 
-def _payload(spec):
+def _subscriptions(spec, slack_destination_id):
+    """Who this alert notifies.
+
+    Email always: it is the durable record, searchable months later, and it
+    survives someone leaving the Slack workspace.
+
+    Slack additionally, for PAGE only. The Slack app pushes to a phone, which
+    is what makes a page a page rather than an email nobody reads until
+    morning. Restricting it to PAGE is what keeps the channel worth looking at
+    -- see the ALERTS comment above.
+
+    A missing destination id is not an error: the alerts are still worth having
+    on email, and failing the whole run because Slack is not configured yet
+    would make notification setup a prerequisite for monitoring rather than an
+    enhancement of it.
+    """
+    subscriptions = [{"user_email": NOTIFY_EMAIL}]
+    if spec.get("page") and slack_destination_id:
+        subscriptions.append({"destination_id": slack_destination_id})
+    return subscriptions
+
+
+def _payload(spec, slack_destination_id=None):
     return {
         "display_name": spec["name"],
         "query_text": spec["sql"],
@@ -309,7 +462,7 @@ def _payload(spec):
             # UNKNOWN, a recovered pipeline never clears the alert.
             "empty_result_state": "OK",
             "notification": {
-                "subscriptions": [{"user_email": NOTIFY_EMAIL}],
+                "subscriptions": _subscriptions(spec, slack_destination_id),
                 # Do not notify on recovery. Recovery mail doubles volume and
                 # trains people to skim; the dashboard shows current state.
                 "notify_on_ok": False,
@@ -323,9 +476,40 @@ def _payload(spec):
     }
 
 
+def _slack_destination_id(host, headers):
+    """Look up the Slack destination by name, or None if absent.
+
+    Resolved by NAME rather than taking an id as an argument, so this script
+    stays runnable with no parameters and cannot be run against a stale id
+    someone pasted from an old terminal. The name is the contract between this
+    script and create_notification_destinations.py.
+    """
+    listing = _api(host, headers, "GET", "/api/2.0/notification-destinations")
+    if "ERROR" in str(listing):
+        return None
+    for row in listing.get("results", []) or []:
+        if row.get("display_name") == SLACK_DESTINATION_NAME:
+            return row.get("id")
+    return None
+
+
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
     host, headers = _client()
+
+    slack_id = _slack_destination_id(host, headers)
+    if slack_id:
+        print(f"Slack destination: {SLACK_DESTINATION_NAME} ({slack_id})")
+    else:
+        # Stated loudly rather than passed over. Someone running this expects
+        # pages to reach their phone; silently degrading to email-only is the
+        # kind of thing discovered during an incident.
+        print(
+            f"WARNING: no notification destination named "
+            f"'{SLACK_DESTINATION_NAME}'.\n"
+            "         PAGE alerts will notify EMAIL ONLY.\n"
+            "         Run scripts/create_notification_destinations.py first."
+        )
 
     # v2 returns {"alerts": [...]}. v1 returns {"results": [...]}. Reading the
     # wrong key yields an empty dict, every alert looks new, and a rerun
@@ -336,13 +520,14 @@ def main() -> None:
     }
 
     for spec in ALERTS:
-        payload = _payload(spec)
+        payload = _payload(spec, slack_id)
         alert_id = existing.get(spec["name"])
+        channels = "slack+email" if (spec.get("page") and slack_id) else "email"
 
         if dry_run:
             action = "UPDATE" if alert_id else "CREATE"
             print(f"[dry-run] {action}: {spec['name']} "
-                  f"(bind {spec['column']}, cron {spec['cron']})")
+                  f"(bind {spec['column']}, cron {spec['cron']}, -> {channels})")
             continue
 
         if alert_id:
@@ -358,7 +543,7 @@ def main() -> None:
         if "ERROR" in result:
             print(f"FAILED  {spec['name']}: {result}")
         else:
-            print(f"ok      {spec['name']}  id={result.get('id')}")
+            print(f"ok      {spec['name']}  id={result.get('id')}  -> {channels}")
 
 
 if __name__ == "__main__":
