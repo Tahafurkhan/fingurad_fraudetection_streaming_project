@@ -20,7 +20,35 @@ resources:
       # continuous mode would hold compute open indefinitely. Switch to
       # continuous when latency matters more than cost.
       continuous: false
-      development: true
+      # Per-target (see databricks.yml). Hardcoding `true` here is what made
+      # `bundle validate -t prod` fail -- production mode rejects a
+      # development pipeline outright.
+      development: ${var.pipeline_development_mode}
+
+      # SCHEDULE. Without this the pipeline only runs when someone triggers it,
+      # which makes every latency claim theoretical.
+      #
+      # 15 minutes comes from the NFR-01 budget, not from taste. End-to-end
+      # latency is trigger-interval + execution + watermark delay; execution
+      # measured ~4 minutes and the fraud_card_alert watermark is 5 minutes, so
+      # a 15-minute trigger gives a worst case around 24 minutes against a
+      # 15-minute P95 target -- tight, and the honest reading is that the
+      # target is met typically rather than at P95. Going shorter costs a
+      # cluster start per run for latency the analyst queue does not consume;
+      # see docs/technical_requirements_document.md 5.2.
+      #
+      # Not continuous mode: that holds compute open 24/7 to beat a watermark
+      # floor it cannot beat anyway.
+      #
+      # NOTE ON PAUSING. A pipeline cron trigger has no `pause_status` field --
+      # unlike a job schedule, which does. `bundle validate` reports it as an
+      # unknown field rather than an error, so a paused-looking pipeline would
+      # in fact run. The schedule expression itself is therefore the variable:
+      # dev sets it empty, which omits the trigger entirely.
+      trigger:
+        cron:
+          quartz_cron_schedule: ${var.pipeline_cron}
+          timezone_id: Asia/Kolkata
 
       # COST ATTRIBUTION TAGS.
       #
@@ -129,7 +157,13 @@ resources:
       schema: silver
       serverless: true
       continuous: false
-      development: true
+      development: ${var.pipeline_development_mode}
+
+      # No independent schedule. This pipeline is driven by the daily job,
+      # which sequences it against the streaming pipeline before dbt runs.
+      # Giving it its own cron would let it publish customer dimensions
+      # mid-way through a dbt snapshot, which is exactly the ordering the job
+      # exists to prevent.
 
       # Same attribution scheme as the main pipeline. Tagged separately rather
       # than inherited: these are two pipelines with independent lifecycles, and

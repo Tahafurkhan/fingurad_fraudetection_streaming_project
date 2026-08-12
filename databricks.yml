@@ -27,6 +27,31 @@ variables:
     description: Address that receives job failure notifications.
     default: tahafurkhan@gmail.com
 
+  pipeline_development_mode:
+    description: >
+      Lakeflow development mode. TRUE keeps the cluster warm between updates
+      and skips retries so a failure surfaces immediately -- right for
+      iterating, wrong for production.
+    # Defaults false so a new target is production-safe unless it opts in.
+    # The reverse default would mean forgetting to set it produces a
+    # development pipeline in production, which is the failure worth
+    # designing against.
+    default: false
+
+  pipeline_cron:
+    description: >
+      Quartz cron for scheduled pipeline updates. A pipeline cron trigger has
+      no pause_status field (unlike a job schedule), so the expression itself
+      is what varies per target -- dev sets it empty to run on demand only.
+    default: "0 0/15 * * * ?"
+
+  job_schedule_pause:
+    description: >
+      PAUSED or UNPAUSED for the daily orchestration job. Kept separate from
+      pipeline_cron because the two have different cadences and one
+      may legitimately run without the other.
+    default: UNPAUSED
+
 targets:
   # Development. Deploys to the user's own workspace path with resources
   # prefixed by username, so two developers never collide.
@@ -38,6 +63,24 @@ targets:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
     variables:
       catalog: finguard
+      # Development mode belongs to the dev target only.
+      #
+      # This was previously hardcoded `development: true` in the pipeline
+      # resource, which made `bundle validate -t prod` fail outright:
+      #
+      #   Error: target with 'mode: production' cannot include a pipeline
+      #          with 'development: true'
+      #
+      # The prod target had therefore never validated, let alone deployed.
+      # Lifting it to a variable lets one pipeline definition serve both
+      # targets without a second copy that would drift.
+      pipeline_development_mode: true
+      # Dev does not run on a schedule. A developer's workspace waking up
+      # every 15 minutes to consume Kafka is spend with nobody watching the
+      # output -- and two targets consuming the same topic on independent
+      # schedules would make offset positions hard to reason about.
+      pipeline_cron: ""
+      job_schedule_pause: PAUSED
 
   # Production. `mode: production` makes the deployment strict: it refuses to
   # deploy if the local tree differs from what is committed, and it removes the
@@ -49,9 +92,51 @@ targets:
       root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
     variables:
       catalog: finguard
-    # Production resources are owned by a service principal in a real
-    # deployment. Left as the current user here because this workspace has no
-    # service principal provisioned -- stating that plainly rather than
-    # pretending otherwise.
+
+    # Explicit permissions on the shared root path.
+    #
+    # `bundle validate` warns that /Workspace/Shared is writable by all
+    # workspace users, and it is right to: anyone could edit the deployed
+    # pipeline source out from under a running job. The warning asks for the
+    # access to be declared rather than incidental, which is the correct fix --
+    # silencing it by moving prod under a personal user path would make
+    # production depend on one person's directory surviving.
+    #
+    # CAN_VIEW rather than CAN_MANAGE for users: they can see what production
+    # is running, which is useful for debugging, but cannot change it. On a
+    # single-workspace Free Edition tier this is the available approximation of
+    # separating who deploys from who observes.
+    #
+    # THE WARNING DOES NOT GO AWAY, AND THAT IS CORRECT. `bundle validate`
+    # keeps flagging /Workspace/Shared as writable by all users because the
+    # underlying filesystem path genuinely is -- these resource permissions
+    # govern the deployed jobs and pipelines, not the directory holding their
+    # source. Declaring CAN_MANAGE for `users` would silence the warning by
+    # agreeing that everyone may manage production, which is the opposite of
+    # what is wanted. Real isolation needs a workspace this tier does not
+    # provide, so the warning stays as an accurate description of a known
+    # limitation. See docs/technical_requirements_document.md RISK-06.
+    permissions:
+      - level: CAN_VIEW
+        group_name: users
+      # The deploying identity needs explicit CAN_MANAGE, otherwise it only
+      # holds those rights when the deploy happens to run as the same user who
+      # created the resources -- which stops being true the moment CD deploys
+      # as the service principal.
+      - level: CAN_MANAGE
+        service_principal_name: 30fb2917-54c6-4149-806c-e95803020406
+      - level: CAN_MANAGE
+        user_name: tahafurkhan@gmail.com
+
+    # Production runs as the deployment service principal, not as a person.
+    #
+    # This matters beyond tidiness: a job owned by a named user breaks when
+    # that user's token expires, their permissions change, or they leave. The
+    # service principal is a separate identity whose credential rotation is a
+    # deliberate act rather than a side effect of HR.
+    #
+    # `github-actions-ci-deploy` is the same principal the CD workflow
+    # authenticates as, so what runs in production is owned by the thing that
+    # deployed it.
     run_as:
-      user_name: tahafurkhan@gmail.com
+      service_principal_name: 30fb2917-54c6-4149-806c-e95803020406

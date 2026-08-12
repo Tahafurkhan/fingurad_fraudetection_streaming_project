@@ -18,7 +18,12 @@ resources:
         # partial one.
         quartz_cron_expression: "0 0 2 * * ?"
         timezone_id: Asia/Kolkata
-        pause_status: PAUSED
+        # Per-target. Previously hardcoded PAUSED, which meant this job -- the
+        # only thing sequencing ingestion before dbt -- never fired. Every
+        # freshness test, SLA measurement and mart refresh depended on someone
+        # remembering to click Run. A platform that only runs when watched is a
+        # script.
+        pause_status: ${var.job_schedule_pause}
 
       # One run at a time. Two concurrent runs would have dbt reading tables
       # another run is mid-write on.
@@ -56,13 +61,21 @@ resources:
             dependencies:
               - dbt-databricks>=1.12.0,<2.0.0
 
-        # The metrics collector needs no third-party packages -- it is Spark SQL
-        # against the event log. A separate environment rather than reusing
-        # dbt_env so it does not install dbt to run a task that never calls it,
-        # and so a dbt version bump cannot affect monitoring.
+        # The pipeline metrics collector needs no third-party packages -- it is
+        # Spark SQL against the event log. A separate environment rather than
+        # reusing dbt_env so it does not install dbt to run a task that never
+        # calls it, and so a dbt version bump cannot affect monitoring.
+        #
+        # databricks-sdk is the one addition, needed by the job metrics
+        # collector: job run history comes from the Jobs API, not from a table.
+        # The SDK ships on Databricks Runtime, but it is declared explicitly
+        # rather than relied upon -- a task that works because of what the
+        # runtime happens to preinstall breaks silently on a runtime upgrade.
         - environment_key: ops_env
           spec:
             client: "3"
+            dependencies:
+              - databricks-sdk
 
       tasks:
         # 1. Ingest. Bronze and silver from Kafka, volumes and CDC; streaming
@@ -164,4 +177,35 @@ resources:
           # Monitoring must not fail the run it monitors. A red pipeline caused
           # entirely by its own observability is worse than no observability --
           # it trains people to ignore the colour.
+          disable_auto_optimization: true
+
+        # 8. Job-level telemetry and SLA measurement.
+        #
+        #    WHY THIS IS SEPARATE FROM collect_metrics. That task mines the
+        #    *pipeline* event log, which covers everything inside a Lakeflow
+        #    update and nothing outside one. The dbt tasks, a task skipped
+        #    because an upstream one failed, a run killed by its timeout, or a
+        #    run that never fired at all leave no trace in a pipeline event
+        #    log -- because no pipeline update happened. OB-01 claims every run
+        #    is queryable; without this task that is only true of pipeline runs.
+        #
+        #    It also measures NFR-01. A 15-minute target that is never measured
+        #    is an aspiration, not an SLA.
+        #
+        #    RUNS LAST, and depends on the final dbt task rather than on
+        #    ingestion. It reports on the run it is part of, so the more of
+        #    that run has finished, the more complete its picture. It cannot
+        #    see its own outcome -- that appears in the next run's collection,
+        #    which is inherent to a job observing itself and is why the table
+        #    is append-only and watermarked rather than updated in place.
+        - task_key: collect_job_metrics
+          depends_on:
+            - task_key: dbt_source_freshness
+          run_if: ALL_DONE
+          spark_python_task:
+            python_file: ../src/pipelines/ops/job_metrics_collector.py
+            parameters:
+              - "--job-ids"
+              - "${resources.jobs.finguard_daily.id}"
+          environment_key: ops_env
           disable_auto_optimization: true
