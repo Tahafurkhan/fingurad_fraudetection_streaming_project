@@ -30,6 +30,7 @@ discount everything else you said.
 | 3 | Metadata-driven ingestion (strongest section) |
 | 4 | Streaming: watermarks, joins, state |
 | 5 | Kafka scenarios (10 verbatim production questions) |
+| 5b | Kafka source failure, retention loss and backfill by layer |
 | 6 | Dimensional modeling (the round that gates offers) |
 | 7 | dbt: incremental, snapshots, the traps |
 | 8 | System design: fraud detection at real scale |
@@ -508,6 +509,194 @@ The trap question. The answer is no, and confidently saying so is the signal.
 
 ---
 
+## Part 5b — When the Kafka source itself breaks
+
+Part 5 is consumer-side: lag, rebalances, poison pills. This part is the
+other half — the source is unreachable, wrong, or has moved on without you.
+Interviewers ask these because they separate "I have consumed from Kafka"
+from "I have been on call for a pipeline that consumes from Kafka."
+
+### "Your Kafka source goes down for six hours. What happens, and what do you do?"
+
+Answer in the order the damage actually arrives, not in the order the
+components appear on an architecture diagram.
+
+> First, what does *not* happen: I do not lose data. Kafka retains messages
+> independently of whether anyone is consuming — default retention is seven
+> days. A six-hour outage of my *consumer* is not a data-loss event, it is a
+> latency event. That distinction drives everything else.
+>
+> What does happen: the streaming query fails and the checkpoint stops
+> advancing. In this project bronze is the only Kafka-fed table, so
+> `finguard.bronze.transactions` stops, and every downstream flow — silver,
+> both gold alert tables, both email sinks — is marked SKIPPED rather than
+> failed. That cascade is visible in the pipeline event log and is the thing
+> to point at: one source failing does not corrupt anything downstream, it
+> just stops it.
+>
+> The recovery is: fix the cause, restart the pipeline, and the checkpoint
+> resumes from the last committed offset. Six hours of backlog is consumed as
+> fast as the pipeline can go. That is the whole recovery — *if* the outage
+> was shorter than retention.
+>
+> The real question is what happens if it wasn't.
+
+### "It was down longer than the retention window. Now what?"
+
+This is the question behind the question, and the honest answer earns more
+than a confident wrong one.
+
+> Then I have permanent data loss on the Kafka path, and no amount of
+> restarting fixes it. The offsets my checkpoint wants have been deleted from
+> the brokers. On restart I get an `OffsetOutOfRangeException`, or — worse,
+> depending on `auto.offset.reset` — silent behaviour: `latest` skips the gap
+> without telling anyone, `earliest` reprocesses from whatever is left and
+> quietly creates duplicates.
+>
+> `auto.offset.reset` is the setting people get wrong here. Neither value is
+> "safe"; they fail in opposite directions. `latest` loses the gap silently.
+> `earliest` re-reads everything still retained, which for an append-only
+> bronze table means duplicates. This project takes `earliest` deliberately
+> (`starting_offsets: earliest` in `config/sources/transactions.yaml`) and
+> then deduplicates in the mart on `transaction_id`, because for a fraud
+> platform a duplicate you can detect beats a gap you cannot.
+>
+> Recovery has to come from somewhere other than Kafka. In order of
+> preference: replay from the upstream system if it can re-emit; restore from
+> a sink that captured the raw payload before the gap; or accept the gap and
+> record it explicitly. The last one is not defeat — an annotated gap that
+> analysts know about is far better than a silent hole nobody discovers for
+> six months.
+
+### "How do you backfill this pipeline?"
+
+The strong answer is that backfill strategy is decided by *which layer* lost
+data, and the layers have genuinely different answers.
+
+> **Bronze — raw Kafka.** Backfill means re-reading offsets. The mechanism is
+> resetting the checkpoint, not rerunning a job: the checkpoint is what
+> defines "where am I." Delete or move the checkpoint and set
+> `startingOffsets` to the range I want. This project keeps
+> `starting_offsets: earliest` precisely so a rebuilt bronze table replays
+> the full retention window rather than starting from now — the comment in
+> `transactions.yaml` says exactly that. The constraint is retention: I can
+> only replay what the brokers still hold.
+>
+> **Silver — derived from bronze.** Never backfilled from Kafka. Bronze is
+> the raw record and it is append-only with no watermark, so silver is a full
+> refresh from bronze whenever parsing logic changes. This is the entire
+> reason bronze stores the unparsed payload as a string — when a JSON parsing
+> bug shipped in this project, bronze still had every raw message, so the fix
+> was: correct the code, full-refresh silver, no data loss. If parsing had
+> happened at ingest that data would have been gone.
+>
+> **Gold — stateful.** The hardest layer, and the one people underestimate.
+> Gold contains watermarked stream-stream joins and windowed aggregates. A
+> full refresh does not reproduce the original output, because the join's
+> state was built from arrival order that cannot be recreated. Replaying
+> historical data through a five-minute watermark means most of it is now
+> late and gets dropped. So gold backfill is *recomputation in batch*, not
+> replay through the streaming operator — the same logic expressed as a batch
+> query over silver, which is the point at which you accept that the
+> streaming and batch code paths must be reconciled.
+>
+> **Marts — dbt.** The easiest, because they are already designed for it.
+> `fct_transactions` is incremental with `merge` on `transaction_id`, so
+> reprocessing an overlapping window is idempotent by construction. There is
+> a deliberate three-day overlap window in the incremental filter for exactly
+> this reason. A full backfill is `dbt run --full-refresh`.
+
+The one-line version worth having ready:
+
+> Bronze replays from Kafka offsets, silver full-refreshes from bronze, gold
+> gets recomputed in batch rather than replayed, and the marts merge
+> idempotently. Each layer's backfill mechanism is a consequence of what that
+> layer stores.
+
+### "Your pipeline reports healthy but bronze is empty. Debug it."
+
+Volunteering this one is strong because the failure is invisible in every
+dashboard.
+
+> Empty-but-healthy means the pipeline is successfully reading nothing, which
+> is a configuration problem, not a runtime one. The order I would check:
+>
+> **Topic name mismatch.** The producer writes to one topic, the pipeline
+> subscribes to another. Both are individually correct and nothing errors —
+> the consumer just sits on an empty topic. This project's `.env.example`
+> carries an explicit warning about it because the topic name lives in two
+> places: the producer's `.env` and the Databricks secret scope. If they
+> disagree, bronze stays empty with no error anywhere.
+>
+> **`startingOffsets: latest` on first run.** The stream starts from "now,"
+> so anything produced before it started is invisible. Looks like an empty
+> topic; is actually a cursor placed past the data.
+>
+> **Consumer group already advanced.** A previous run committed offsets to
+> the end of the topic, and the new run resumes from there.
+>
+> **Credentials valid but wrong cluster.** Authentication succeeds against a
+> Confluent cluster that simply does not have your topic.
+>
+> The diagnostic that collapses all four at once: query the topic's watermark
+> offsets directly with a standalone consumer. If high-watermark is greater
+> than zero, the data exists and the pipeline's view of it is wrong. If it is
+> zero, the producer is the problem, not the consumer.
+
+### "Walk me through a Kafka authentication failure you have actually hit."
+
+Concrete, from this project — the credential-rotation trap.
+
+> The symptom was `SaslAuthenticationException: Authentication failed` on
+> `finguard.bronze.transactions`, with every downstream flow marked SKIPPED.
+> The confusing part was that my producer was writing to the same topic
+> successfully at the same moment.
+>
+> The cause: the credentials existed in two places. The producer reads them
+> from a local `.env`; the pipeline reads them from a Databricks secret scope
+> (`finguard-scope/kafka_connection_details`). The Confluent API key had been
+> rotated, and only the `.env` was updated. Rotating a key at the provider
+> does not propagate to the secret store — they have to change together.
+>
+> What made it findable quickly was that the two paths disagreed: a working
+> producer and a failing consumer against the same cluster is almost always
+> credentials, not connectivity. If both had failed, I would have suspected
+> the network or the cluster.
+>
+> The prevention is to stop having two copies. One source of truth for the
+> credential, with the producer reading from the same secret store as the
+> pipeline. Until that is done, rotation is a two-step procedure and the
+> second step is easy to forget — which is why it is written down in
+> `docs/setup.md` under the exact exception text, so the next person greps
+> the error and finds the answer.
+
+### "How would you make this resilient without over-engineering it?"
+
+> Three things, in the order I would actually build them.
+>
+> **Alert on staleness, not just failure.** A failed pipeline pages someone.
+> A pipeline that succeeds while reading zero rows does not. The check that
+> matters is "bronze row count has not increased in N minutes," which is a
+> query against the ops tables rather than a pipeline state.
+>
+> **Monitor consumer lag as a first-class metric.** Lag is the earliest
+> honest signal that consumption is falling behind production; every other
+> symptom is downstream of it.
+>
+> **Extend retention beyond the recovery window.** Seven days of retention
+> means a seven-day outage is unrecoverable. If the realistic worst-case
+> recovery is three days, seven days of retention is thin. Retention is
+> cheap; re-deriving lost transactions is not possible at all.
+>
+> What I would not build for this project: a secondary Kafka cluster with
+> mirroring, or a dual-write path to object storage. Both are real patterns
+> and both are wrong here — this runs at five transactions per second for a
+> portfolio, and the failure mode they protect against (total cluster loss)
+> is less likely than the ones I have actually hit, which were all
+> configuration.
+
+---
+
 ## Part 6 — Dimensional modeling
 
 The highest-signal round. The most common rejection is not a wrong schema — it
@@ -593,6 +782,62 @@ A senior-level question with a specific expected answer.
 
 This is a genuinely common production bug and having hit it is worth more than
 having read about it.
+
+### "How late can data arrive before you lose it?"
+
+The question behind the question is whether you know your own configuration or
+just inherited it. Most candidates answer "we have a watermark" and stop.
+
+> There are **three** late-arrival settings in this platform, three orders of
+> magnitude apart, and they protect different things:
+>
+> | Layer | Mechanism | Window | Protects |
+> |---|---|---|---|
+> | Silver | `dropDuplicatesWithinWatermark` | 10 min | Duplicate suppression |
+> | Gold | stream-stream join watermark | 5 min | Watchlist matching |
+> | dbt fact | incremental overlap | 3 days | Straggler reprocessing |
+>
+> The important distinction is **how each one fails**. The two streaming
+> watermarks fail visibly — state grows, and the event log counts
+> dropped-late rows in `ops.stream_health.num_rows_dropped_late`.
+>
+> The dbt window fails **silently**. A transaction arriving after the overlap
+> never matches the incremental filter. It is not rejected, not quarantined,
+> not logged. It never enters the fact table, and the run is green with a
+> plausible row count.
+
+**The follow-up that separates answers: "so how do you know 3 days is right?"**
+
+> I did not, which is why I now measure it. The fact carries
+> `arrival_delay_hours` and `arrival_delay_days`, and
+> `marts.late_arrival_monitor` aggregates them daily with p50, p95, p99 and
+> max. Percentiles rather than an average, because arrival delay is heavily
+> right-skewed — almost everything lands in seconds, a few retries land hours
+> later, and a mean over that describes no actual transaction.
+>
+> The column to alert on is `headroom_days`: how much slack is left before the
+> window stops covering observed lateness. It reaches zero *before* rows start
+> disappearing, which is what makes it actionable rather than forensic.
+
+**And the honest limitation, which you should volunteer rather than be caught
+on:**
+
+> That monitor cannot see what it has already lost. Rows that fell outside the
+> window never entered the model, so `BREACHED` does not mean "we lost data" —
+> it means "the window is no longer known to be sufficient". It is the last
+> warning available, not a loss report. Bounding actual loss needs a
+> reconciliation between the mart and bronze, which is a separate check.
+
+> **Why the two windows differ by a day.** The source filter measures from the
+> data's own max event time; the merge predicate measures from
+> `current_timestamp()`. Those drift apart whenever ingestion lags. If they
+> were equal, a row at the edge could fail to match its existing counterpart
+> and MERGE would INSERT a duplicate instead of UPDATE, breaking the unique
+> test. Both now derive from one variable so they cannot drift.
+
+**Why this answer lands.** It shows you know that a defensive setting and a
+*measured* setting are different things, and that the difference is whether
+anyone would notice when it stops being enough.
 
 ### "What if a fact arrives for a customer that doesn't exist in the dimension?"
 

@@ -321,12 +321,114 @@ the real design honestly. Email is what is actually wired, and it is verified.
 
 ---
 
+## Tier A2 — Job-level telemetry and SLA measurement
+
+Added after a gap review found OB-01 ("every pipeline run shall persist its
+outcome") was only true of *pipeline* runs.
+
+### The blind spot
+
+`metrics_collector.py` mines the Lakeflow event log. That covers everything
+inside a pipeline update and nothing outside one — which leaves out the dbt
+tasks, a task skipped because an upstream one failed, a run killed by its
+timeout, and a run that never fired at all.
+
+The last case is the dangerous one. **If the scheduled job stops firing
+entirely** — paused schedule, expired credential, permissions change — the
+pipeline event log stays quiet and every existing detector reports healthy.
+Silence is indistinguishable from success when the only thing you watch is the
+thing that did not run.
+
+### What was added
+
+`src/pipelines/ops/job_metrics_collector.py`, writing three tables:
+
+| Table | Grain | Answers |
+|---|---|---|
+| `ops.job_runs` | One orchestration run | Did it run at all? How did it end? |
+| `ops.job_task_runs` | One task within a run | *Which step* failed — ingestion or dbt? |
+| `ops.job_sla` | One measurement per successful run | Did it meet NFR-01? |
+
+Task-level grain matters on a seven-task DAG: "the pipeline is broken" and
+"dbt_test failed while ingestion succeeded" have entirely different responses at
+02:00.
+
+### The SLA table, and what it deliberately does not measure
+
+NFR-01 sets 15 minutes end-to-end. `ops.job_sla` records per-run latency against
+that target, decomposed into queue time (cold start, contention) and execution
+time — because a slow start is a compute problem and slow execution is a query
+problem, and a single total hides which one you have.
+
+**This is a deliberate under-measurement and must not be read as the full
+figure.** The job clock starts when the run is *scheduled*; the SLA clock starts
+when the *transaction occurred*. Missing:
+
+- time the event waited in Kafka before the run triggered — the dominant term
+- watermark delay on the stream-stream join — up to 5 minutes
+
+So a run comfortably inside 900s does not prove the SLA is met. What it proves
+is the controllable part: **if execution alone approaches the target, no trigger
+interval can rescue it.** True end-to-end needs event-time-to-alert-time per row
+(TRD FUT-06).
+
+---
+
+## Tier A3 — Lineage as a queryable graph
+
+Unity Catalog captures column-level lineage automatically. It is genuinely
+useful and almost never used, because it lives in a UI panel one table at a
+time. `sql/ops/lineage_export.sql` turns it into five views.
+
+| View | Answers |
+|---|---|
+| `v_table_lineage` | Deduplicated table-level edges |
+| `v_column_lineage` | Which downstream columns read a given column |
+| `v_downstream_impact` | Everything downstream, transitively, with hop count |
+| `v_orphan_tables` | Tables nothing reads |
+| `v_layer_rule_violations` | Edges that skip a medallion layer (TRD AR-01) |
+
+**`v_downstream_impact` is the one that earns its keep.** The Kafka contract
+gives 90 days' notice on a removed field. Using that notice means knowing what
+the field feeds — and on a four-layer platform plus marts, guessing from memory
+is how a dashboard silently breaks a month later. Measured on
+`silver.transactions`: 12 downstream objects, 3 hops deep.
+
+### Both new detectors were wrong on their first run
+
+Recorded because the reflex is to trust a new detector and explain away the
+data:
+
+- **`v_layer_rule_violations` flagged three correct edges.** dbt staging models
+  read silver directly, which is right — routing them through gold would push
+  dimension source data through a layer built for streaming aggregates. **The
+  rule was changed, not the finding explained.** A detector that reports
+  known-good edges every run is one people stop reading.
+- **`v_orphan_tables` returned 15 rows, none of them user tables** — all
+  Lakeflow internals (`__materialization_mat_*`, `event_log_*`, sink tables).
+  Excluded by pattern.
+
+### The retention caveat
+
+Lineage records what has *run recently* (currently 90 days), so it is evidence,
+not a static graph. Two artefacts proved this immediately: a `marts_marts`
+schema that no longer exists still appears, and `silver.transactions` shows as
+its own downstream via the dedup operator's self-edge. A quarterly job outside
+the window would be invisible entirely.
+
+---
+
 ## What is not covered
 
-- **End-to-end freshness alerting is not fully validated.** The stall detector
-  is proven to fire on a real stalled watermark, but not to clear on recovery —
-  the Kafka producer cannot run from the current network (port 9092 blocked),
-  so a live recovery could not be induced.
+- **The stall detector is proven to fire, not to clear.** It fired on a real
+  stalled watermark. A live recovery has since been induced — the producer runs
+  and the pipeline consumed a 164-message backlog to lag zero — but the detector
+  clearing was not itself observed end-to-end.
+- **`ops.job_sla` measures job latency, not end-to-end latency.** See Tier A2.
+- **A job cannot see its own outcome.** `collect_job_metrics` runs last and
+  reports on the run it belongs to, so its own result appears in the *next*
+  run's collection. Inherent to a job observing itself; why the tables are
+  append-only and watermarked.
 - **Only `stateOperators[0]` is read.** Every stateful flow here has exactly one
   stateful operator. A flow with two would have the second silently ignored.
 - **The collector is single-threaded over pipelines.** Fine for two; would need

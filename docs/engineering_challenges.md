@@ -1030,7 +1030,50 @@ reader.option("failOnDataLoss", str(cfg.get("fail_on_data_loss", True)).lower())
 
 Real migrations are handled by resetting the checkpoint deliberately.
 
-## 17.4 Interview Angle
+## 17.4 Recurrence — 2026-08-11 (runbook validated)
+
+This failed again, and the recorded fix held. Worth logging because the
+second occurrence had a *different* trigger and the same remedy.
+
+Sequence, from the pipeline event log:
+
+1. `SaslAuthenticationException: Authentication failed` on
+   `finguard.bronze.transactions`. Every downstream flow SKIPPED. The
+   producer was writing to the same topic successfully at that moment —
+   a working producer against a failing consumer is almost always
+   credentials, not connectivity.
+2. Cause: the Confluent API key had been rotated locally
+   (`src/producer/.env`) but not in `finguard-scope/kafka_connection_details`.
+   The two copies disagreed. Fixed with `databricks secrets put-secret`.
+3. Auth then passed and bronze consumed all 352 messages the producers had
+   sent — offsets reached `{0:72, 1:63, 2:51, 3:53, 4:55, 5:58}`.
+4. The *next* micro-batch threw `KafkaIllegalStateException: Some data may
+   have been lost`. The topic had been recreated at some earlier point, so
+   checkpoint offsets referenced an incarnation the brokers no longer had.
+
+Step 4 is Challenge 17 exactly, reached by topic recreation rather than
+cluster migration. `fail_on_data_loss: true` in
+`config/sources/transactions.yaml` did its job: it refused to continue
+rather than skipping silently.
+
+Remedy was the one prescribed above — a deliberate checkpoint reset via
+`POST /api/2.0/pipelines/{id}/updates {"full_refresh": true}`, not
+`failOnDataLoss: false`. Bronze replayed from `earliest` and the flow ran
+clean.
+
+The cost of that choice, stated plainly: a full refresh re-reads the whole
+retention window, so bronze gains duplicate rows. That is acceptable here
+and by design — bronze is the append-only record of physical delivery, and
+`fct_transactions` already dedupes on `transaction_id` with `merge`
+(Challenge 8 found `TXN266669` at two offsets). A duplicate that is
+detected beats a gap that is not.
+
+**Root cause not yet fixed:** the topic being recreated underneath a live
+checkpoint. In production a topic is immutable infrastructure; recreating
+one invalidates every consumer checkpoint. Either do not recreate, or treat
+it as a migration with checkpoint reset as a documented step.
+
+## 17.5 Interview Angle
 
 **Question:** "What is in a streaming checkpoint, and when must you reset it?"
 
@@ -1203,6 +1246,314 @@ are hourly?"** This tests whether you understand your own data source. Billing
 lands hours late, so an hourly check re-reads the same incomplete day and pages
 repeatedly about one event. Cadence matches how fast the signal can change, not
 how urgent the topic feels.
+
+---
+
+# Challenge 19 — Four copies of one contract, and the test that found the gap
+
+## 19.1 Context
+
+The transaction payload contract is written down in four places:
+`src/producer/schema.py`, `src/pipelines/transforms/transactions.py`, and the
+silver and quarantine models. The duplication is forced, not careless —
+Lakeflow `exec()`s each pipeline file into a uniquely-named synthetic module,
+so pipeline files cannot import a shared constant.
+
+## 19.2 Why duplication here is dangerous rather than merely untidy
+
+A drift between these four produces **no error**. `from_json` returns null for
+any field the schema does not mention, the row still satisfies every rule that
+happens to match, and the pipeline stays green while the data is quietly wrong.
+Row counts are unchanged, so nothing in the existing monitoring reacts.
+
+## 19.3 What the alignment test found
+
+`tests/test_contract_alignment.py` compares all four definitions. On its first
+run it failed with:
+
+```
+AssertionError: Producer requires {'transaction_timestamp', 'status', 'currency'},
+but silver neither drops nor flags on them.
+```
+
+Three fields the producer *guarantees* were unenforced by any consumer rule.
+Checked against production data, all three were fully populated — 825 of 825
+rows non-null. **The guarantee was being honoured, and nothing was enforcing
+it.** That is the distinction the test exists to draw: the absence of a
+violation is not the presence of a control.
+
+## 19.4 Resolution — and why the three were not treated alike
+
+`transaction_timestamp` became a **drop** rule. It is the event-time column:
+every watermark in the project reads it, including the tumbling and sliding
+window aggregates and the stream-stream join. A null there does not cost one
+row, it cannot be placed in any window or advance a watermark, so it degrades
+the whole batch.
+
+`currency` and `status` became **flag** rules. A transaction missing its
+currency is still a real transaction against a real card at a real merchant;
+dropping it would delete fraud evidence to satisfy a metadata rule. Same
+reasoning that keeps `amount > 0` a flag (TRD 9.2).
+
+**The interview angle.** The instinct on finding an unenforced guarantee is to
+enforce it everywhere. The better question is what a violation would *mean*: is
+the row unusable, or merely imperfect? Answering that per field is the
+difference between a quality layer and a row shredder.
+
+---
+
+# Challenge 20 — Two detectors that were wrong on first run
+
+Both were built in the same session as Challenge 19, and both fired
+immediately. Neither finding was a platform defect; both were **defects in the
+detector**, which is worth recording because the reflex is to trust a new
+detector and explain away the data.
+
+## 20.1 The layer-rule detector that flagged correct architecture
+
+`v_layer_rule_violations` encodes TRD AR-01 — no layer may be skipped. First
+run returned three rows:
+
+```
+silver.transactions -> marts.stg_transactions
+silver.customers    -> marts.stg_customers
+silver.merchants    -> marts.stg_merchants
+```
+
+All three are correct. dbt staging models are a conformance layer that reads
+silver directly; routing them through gold would push dimension source data
+through a layer built for streaming alert aggregates.
+
+**The rule was changed, not the finding explained.** A detector that reports
+three known-good edges on every run is one people learn to ignore — and then it
+is not there for the edge that matters (TRD OB-07). What remains flagged is
+`bronze -> gold|marts`, the case with real consequences: unvalidated, unparsed
+payloads feeding business output. Currently zero.
+
+## 20.2 The orphan detector that found only engine plumbing
+
+`v_orphan_tables` first returned 15 rows, none of them user tables:
+`__materialization_mat_*`, `__*_sink`, `event_log_*` — all created by Lakeflow,
+read by Lakeflow, and correctly carrying no lineage. Excluded by pattern. The
+cleaned view surfaces real candidates instead: leftover `*_batch_test` tables
+and an unrelated `multi_agent_otel_*` set sharing the catalog.
+
+## 20.3 Two artefacts of lineage retention, not of the platform
+
+The impact query also surfaced `finguard.marts_marts.stg_transactions` — a
+schema that **no longer exists**. dbt's default `generate_schema_name` appends
+the model schema to the target, producing `marts_marts`; a macro override
+already fixed it. The lineage edge is a historical event still inside the
+90-day retention window.
+
+It also showed `silver.transactions` as its own downstream — a self-edge
+produced by the stateful dedup operator reading the table it writes. Accurate
+as lineage, useless as impact analysis, now excluded.
+
+**The lesson worth keeping:** lineage is evidence of what has *run recently*,
+not a static graph. A quarterly job that has not fired inside the retention
+window is invisible, and a schema deleted last month is still present.
+
+---
+
+# Challenge 21 — Late arrivals: three settings, one problem, no shared owner
+
+## 21.1 The three settings
+
+Lateness is handled in three separate places, by three different mechanisms,
+tuned independently:
+
+| Layer | Mechanism | Value | What it protects |
+|---|---|---|---|
+| Silver dedup | `dropDuplicatesWithinWatermark` | 10 min | Duplicate suppression |
+| Gold join | `withWatermark` on both sides | 5 min | Watchlist match window |
+| dbt fact | Incremental overlap | 3 days | Straggler reprocessing |
+
+Three orders of magnitude apart, and until now **nothing measured whether any
+of them was right**.
+
+## 21.2 Why the dbt window is the dangerous one
+
+The two streaming watermarks fail visibly: state grows, or the event log
+records dropped-late rows. `ops.stream_health.num_rows_dropped_late` counts
+them.
+
+The dbt overlap window fails **silently**. A transaction arriving after the
+window never matches the incremental filter. It is not rejected, not
+quarantined, not logged — it simply never enters `fct_transactions`, and the
+run reports success with a plausible row count.
+
+Both ways of being wrong look identical from outside:
+
+- **too narrow** — silently drops rows
+- **too wide** — reprocesses three days of history every run to catch
+  stragglers that all arrived within seconds
+
+## 21.3 What was added
+
+`fct_transactions` now carries `arrival_delay_hours`, `arrival_delay_days` and
+`is_late_arrival`, measured from event time to silver arrival.
+`marts.late_arrival_monitor` aggregates them per day into a profile with p50,
+p95, p99 and max — percentiles rather than an average, because arrival delay is
+heavily right-skewed and a mean over that distribution describes no actual
+transaction.
+
+The alerting column is `headroom_days`: how much slack remains before the
+window stops covering observed lateness. It reaches zero *before* loss becomes
+possible, which is what makes it actionable.
+
+## 21.4 The limit of this measurement, stated plainly
+
+**Rows that already fell outside the window cannot appear in this monitor** —
+they never entered the model. So `window_status = 'BREACHED'` does **not** mean
+data was lost. It means the window is no longer *known* to be sufficient, which
+is the last warning available before loss becomes possible.
+
+Bounding what has already been lost is a different question, answered by
+reconciling marts against bronze. That is a real gap, not a solved one.
+
+## 21.5 A coupling that was hardcoded in two places
+
+The overlap window appeared as a literal `3 days` in the source filter and as
+`4 days` in `incremental_predicates`. The one-day difference is load-bearing:
+the source filter measures from the data's own max event time, the merge
+predicate measures from `current_timestamp()`, and those drift apart whenever
+ingestion lags. If they were equal, a row at the edge of the window could fail
+to find its existing counterpart and MERGE would INSERT a duplicate rather than
+UPDATE — breaking the `unique` test on `transaction_id`.
+
+Both now derive from one `late_arrival_window_days` var, as does the monitor's
+headroom calculation. **A monitor reporting slack against a different window
+than the filter actually uses would be worse than no monitor.**
+
+## 21.6 The missing conformance, found on the way
+
+`fct_alerts` had a `date_key`. `fct_transactions` did not — so the two facts
+could not be sliced by the same calendar without one of them recomputing date
+parts inline. That is precisely the inconsistency a date dimension exists to
+prevent: two analysts deriving `is_weekend` separately and disagreeing about
+whether the week starts on Sunday.
+
+Added, with a `relationships` test to `dim_date`. That test earns its place:
+`dim_date` spans 2024–2027, so a transaction outside that range produces a key
+pointing at nothing, and every calendar join silently drops it. Bad source
+timestamps are exactly how that happens — an epoch-0 default lands in 1970, a
+millisecond timestamp read as seconds lands in the far future.
+
+**Interview angle.** "How do you handle late-arriving data?" usually gets an
+answer about watermarks. The stronger answer names all three layers, explains
+that they fail differently — two visibly, one silently — and admits which one
+you can only detect approaching failure rather than detect having failed.
+
+---
+
+# Challenge 22 — A merge optimisation that silently produced duplicates
+
+## 22.1 What was configured
+
+`fct_transactions` bounded the target side of its MERGE:
+
+```sql
+incremental_predicates=[
+    "DBT_INTERNAL_DEST.transaction_timestamp >= current_timestamp() "
+    "- interval 4 days"
+]
+```
+
+The reasoning was sound in isolation. Without a predicate, MERGE scans the
+entire target to find matches, so merge cost grows with history even though
+batch size does not. Restricting it to recent files is standard practice.
+
+## 22.2 What it produced
+
+The `unique` test on `transaction_id` failed with 4 rows:
+
+```
+TXN502842  transaction_timestamp 2026-07-13 04:48:19  loaded 2026-08-11
+TXN502842  transaction_timestamp 2026-08-11 16:18:05  loaded 2026-08-12
+```
+
+Same business key, event times a month apart, both present in the fact table.
+
+## 22.3 Root cause
+
+Bronze reads `startingOffsets: earliest`, so a checkpoint reset replays the
+retention window and the same `transaction_id` arrives again — **carrying a
+different event timestamp**. The model already documented this for the
+source-side dedup (`TXN266669` at two offsets with different timestamps).
+
+The error was assuming the *target* could be bounded by event time when the key
+MERGE matches on is not event-time-correlated. The July copy sat outside the
+4-day window, was invisible as a match candidate, and MERGE inserted instead of
+updating.
+
+## 22.4 Why widening the window is not the fix
+
+**Any** time-bounded predicate is wrong here, not merely a too-narrow one. A
+redelivery can carry any event time inside the retention window, so no window
+short enough to help is also wide enough to be correct. Widening it to cover
+retention scans the whole table — which is what the predicate existed to avoid.
+
+Removed. The cost is a full-target scan per merge, mitigated by liquid
+clustering and Delta file skipping rather than by a predicate that trades
+correctness for speed.
+
+## 22.5 The uncomfortable part
+
+The code comment beside that config described this exact failure — "MERGE would
+then INSERT a duplicate rather than UPDATE, breaking the unique test on
+transaction_id" — and prescribed a one-day safety margin. **The mechanism was
+understood and the mitigation was still wrong**, because the analysis assumed
+drift of hours between two clocks rather than redelivery separated by a month.
+
+The test caught what the reasoning missed. That is the argument for having the
+test even when you are confident.
+
+**Interview angle.** "Tell me about a performance optimisation that was wrong."
+The predicate made merges cheaper and the data incorrect, and the incorrectness
+was invisible until a uniqueness test ran. Optimisations that trade correctness
+usually announce themselves as latency wins.
+
+---
+
+# Challenge 23 — A distribution detector that alerted on a healthy platform
+
+## 23.1 First run, six alerts
+
+`v_categorical_mix_shift` compares each category's share of today's volume
+against a trailing 7-day baseline. Its first run returned six rows:
+
+| change | dimension | value | baseline | current |
+|---|---|---|---|---|
+| 95.88 pts | country | India | **0.0%** | 95.88% |
+| 59.03 pts | transaction_type | PURCHASE | **0.0%** | 59.03% |
+| 34.42 pts | payment_channel | POS | **0.0%** | 34.42% |
+
+Every row `NEW_VALUE`, every baseline `0.0%`.
+
+## 23.2 Nothing had shifted
+
+The baseline window was empty. All 825 transactions had arrived that day after
+a full refresh, so every category legitimately present looked brand new.
+
+The detector was arithmetically correct and operationally useless: it would
+alert on every fresh deployment, every backfill, every restore — the moments
+when someone is already watching and least needs a page.
+
+## 23.3 The fix, and the principle
+
+A minimum baseline requirement: dimensions with fewer than 100 rows of history
+are excluded rather than reported as having changed entirely.
+
+> **An empty baseline means "cannot assess", not "everything changed."** A
+> detector unable to distinguish those is one people mute in its first week —
+> and a muted detector is worse than an absent one, because it looks like
+> coverage.
+
+This is the third detector in this project to be wrong on its first run
+(see #20). The pattern is consistent enough to be worth naming: **a new
+detector's first firing is more likely to be a defect in the detector than in
+the platform.** Treat it as a hypothesis to verify, not a finding to act on.
 
 ---
 

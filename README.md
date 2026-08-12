@@ -289,6 +289,7 @@ docs/                  architecture, challenges, governance, interview prep
 
 | Document | Contents |
 |---|---|
+| [Technical Requirements](docs/technical_requirements_document.md) | The TRD this was built against — stakeholders, RACI, SLAs, data contracts, PCI/GDPR scope, risk register. Includes two change requests the build forced on the design |
 | [Setup](docs/setup.md) | Running this on a fresh machine, plus troubleshooting |
 | [Engineering challenges](docs/engineering_challenges.md) | 17 real failures — error text, root cause, fix, interview angle — including one measured negative result |
 | [Data governance](docs/data_governance.md) | PII masking, classification, access model, and the two leaks the verification found |
