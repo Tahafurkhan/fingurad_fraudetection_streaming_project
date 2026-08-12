@@ -67,7 +67,19 @@ _TABLE_PROPERTIES = {
 @dp.expect_or_drop("valid_customer_id","customer_id IS NOT NULL")
 @dp.expect_or_drop("valid_card_number","card_number IS NOT NULL")
 @dp.expect_or_drop("valid_merchant_id","merchant_id IS NOT NULL")
+# The event-time column. Added after a contract-alignment test found the
+# producer guarantees this field while no consumer rule enforced it. A null
+# here does not cost one row -- it cannot be placed in any window or advance a
+# watermark, so it degrades the dedup below and every windowed aggregate
+# downstream. See src/pipelines/transforms/transactions.py.
+@dp.expect_or_drop("valid_transaction_timestamp","transaction_timestamp IS NOT NULL")
 @dp.expect("valid_amount","amount > 0")
+# Flag, not drop. The producer guarantees both, but a transaction missing its
+# currency or status is still a real transaction against a real card --
+# dropping it would delete fraud evidence to satisfy a metadata rule. Counted
+# so a producer regression shows as a flag-rate spike rather than silence.
+@dp.expect("valid_currency","currency IS NOT NULL")
+@dp.expect("valid_status","status IS NOT NULL")
 def transactions_silver() -> DataFrame:
     # Project the columns this model needs at the point of read.
     #
@@ -120,4 +132,43 @@ def transactions_silver() -> DataFrame:
         ,F.current_timestamp().alias("silver_ingestion_timestamp")
     )
 
-    return tranformed_df
+    # Deduplicate on transaction_id. Implements FR-11 (TRD 4.2).
+    #
+    # WHY THIS IS NEEDED AT ALL. The Kafka delivery contract is at-least-once,
+    # not exactly-once (TRD 6.1). A producer retry after an ambiguous ack, or a
+    # consumer replay of a batch that failed before its offsets committed,
+    # delivers the same transaction twice. Both are normal operation, not
+    # faults. Without dedup one fraudulent transaction raises two alerts, and
+    # every gold aggregate double-counts.
+    #
+    # This was measured before being added: at the time, silver held 825 rows
+    # and 825 distinct transaction_ids. Zero duplicates -- but that is the
+    # absence of a retry so far, not the presence of a control. The count
+    # proves nothing about the next replay.
+    #
+    # WHY dropDuplicatesWithinWatermark, NOT dropDuplicates. The plain version
+    # keeps every key it has ever seen in the state store forever so it can
+    # recognise a duplicate arriving at any future time. On an unbounded stream
+    # that is a memory leak with a slow fuse: it works in test, works for
+    # weeks, then fails the pipeline. The watermarked version bounds state, at
+    # the cost of missing duplicates separated by more than the watermark.
+    #
+    # WHY THE WATERMARK IS ON transaction_timestamp. Event time, not ingestion
+    # time. A replayed message is re-ingested now but carries its original
+    # event time, so watermarking on ingestion time would place the original
+    # and its replay in different windows and defeat the deduplication
+    # entirely. merchants_silver.py watermarks on bronze_ingestion_timestamp
+    # for the opposite reason -- a re-uploaded file is a genuinely new arrival
+    # of the same snapshot, and file drops have no meaningful event time.
+    #
+    # 10 minutes is taken from the failure mode, not chosen for roundness:
+    # at-least-once duplicates are retries, and retries arrive within seconds.
+    # 10 minutes is generous headroom over that while keeping the state store
+    # small. Defined alongside the payload contract in
+    # src/pipelines/transforms/transactions.py so the models and the tests
+    # share one number rather than drifting apart.
+    deduplicated_df = tranformed_df.withWatermark(
+        "transaction_timestamp", "10 minutes"
+    ).dropDuplicatesWithinWatermark(["transaction_id"])
+
+    return deduplicated_df

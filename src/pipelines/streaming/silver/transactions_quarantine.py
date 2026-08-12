@@ -58,6 +58,12 @@ _DROP_RULES = {
     "valid_customer_id": "customer_id IS NOT NULL",
     "valid_card_number": "card_number IS NOT NULL",
     "valid_merchant_id": "merchant_id IS NOT NULL",
+    # Must stay in step with fingurad_silver.py. These two rule sets are the
+    # two halves of one partition -- silver keeps what passes, this table keeps
+    # what fails. A rule present in one and missing from the other creates rows
+    # that satisfy neither, which vanish with no record in either table.
+    # tests/test_contract_alignment.py asserts they match.
+    "valid_transaction_timestamp": "transaction_timestamp IS NOT NULL",
 }
 
 
